@@ -2,7 +2,7 @@ CC = gcc
 
 CFLAGS = -Wall -Wextra -Iinclude
 
-LDFLAGS = -lSDL2
+LDFLAGS = -lSDL2 -lfreetype
 
 SRC = $(wildcard src/*.c)
 
