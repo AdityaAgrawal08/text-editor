@@ -1,0 +1,1 @@
+sudo pacman -S sdl2 freetype2
