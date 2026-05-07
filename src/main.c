@@ -45,7 +45,7 @@ void line_insert_char(Line *line, int index, char c) {
 }
 
 int get_line_x_position(FT_Face face, Line *line, int col) {
-  int x = 20;
+  int x = 80;
   for (int i = 0; i < col; i++) {
     char c = line->data[i];
     if (c == ' ') {
@@ -318,8 +318,63 @@ int main() {
 
     int y = 40;
     for (int row = 0; row < editor.line_count; row++) {
+      char line_number_text[16];
+      if (row == editor.cursor_row) {
+        snprintf(line_number_text, sizeof(line_number_text), "%d", row + 1);
+      } else {
+        snprintf(line_number_text, sizeof(line_number_text), "%d",
+                 abs(row - editor.cursor_row));
+      }
+
+      int number_x = 20;
+      for (int i = 0; line_number_text[i] != '\0'; i++) {
+        if (FT_Load_Char(face, line_number_text[i], FT_LOAD_RENDER)) {
+          continue;
+        }
+
+        FT_GlyphSlot glyph = face->glyph;
+        SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
+            0, glyph->bitmap.width, glyph->bitmap.rows, 32,
+            SDL_PIXELFORMAT_RGBA32);
+
+        if (!surface) {
+          continue;
+        }
+
+        SDL_LockSurface(surface);
+        Uint8 r = 120;
+        Uint8 g = 120;
+        Uint8 b = 120;
+        if (row == editor.cursor_row) {
+          r = 255;
+          g = 200;
+          b = 60;
+        }
+        Uint32 *pixels = (Uint32 *)surface->pixels;
+        int pitch_pixels = surface->pitch / 4;
+        for (unsigned int gy = 0; gy < glyph->bitmap.rows; gy++) {
+          for (unsigned int gx = 0; gx < glyph->bitmap.width; gx++) {
+            unsigned char alpha =
+                glyph->bitmap.buffer[gy * glyph->bitmap.pitch + gx];
+            pixels[gy * pitch_pixels + gx] =
+                SDL_MapRGBA(surface->format, r, g, b, alpha);
+          }
+        }
+
+        SDL_UnlockSurface(surface);
+        SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        SDL_Rect dst = {number_x + glyph->bitmap_left, y - glyph->bitmap_top,
+                        glyph->bitmap.width, glyph->bitmap.rows};
+
+        SDL_RenderCopy(renderer, texture, NULL, &dst);
+        number_x += glyph->advance.x >> 6;
+        SDL_DestroyTexture(texture);
+        SDL_FreeSurface(surface);
+      }
+
       Line *line = &editor.lines[row];
-      int x = 20;
+      int x = 80;
       for (int col = 0; col < line->length; col++) {
         char c = line->data[col];
         if (c == ' ') {
@@ -370,7 +425,7 @@ int main() {
       y += 40;
     }
 
-    int cursor_x = 20;
+    int cursor_x = 80;
     int cursor_y = 40 + (editor.cursor_row * 40);
     Line *cursor_line = &editor.lines[editor.cursor_row];
 
@@ -387,7 +442,7 @@ int main() {
       cursor_x += face->glyph->advance.x >> 6;
     }
 
-    SDL_Rect cursor = {cursor_x, cursor_y - 24, 2, 24};
+    SDL_Rect cursor = {cursor_x, cursor_y - 20, 2, 28};
     if (cursor_visible) {
       SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
       SDL_RenderFillRect(renderer, &cursor);
