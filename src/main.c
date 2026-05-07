@@ -17,9 +17,9 @@ typedef struct {
   Line *lines;
   int line_count;
   int line_capacity;
-
   int cursor_row;
   int cursor_col;
+  int preferred_col;
 } Editor;
 
 void line_init(Line *line) {
@@ -103,6 +103,7 @@ int main() {
   line_init(&editor.lines[0]);
   editor.cursor_row = 0;
   editor.cursor_col = 0;
+  editor.preferred_col = 0;
   bool running = true;
 
   Uint32 last_blink = SDL_GetTicks();
@@ -121,6 +122,7 @@ int main() {
         Line *line = &editor.lines[editor.cursor_row];
         line_insert_char(line, editor.cursor_col, event.text.text[0]);
         editor.cursor_col++;
+        editor.preferred_col = editor.cursor_col;
         break;
       }
 
@@ -132,6 +134,7 @@ int main() {
                     &line->data[editor.cursor_col],
                     line->length - editor.cursor_col + 1);
             editor.cursor_col--;
+            editor.preferred_col = editor.cursor_col;
             line->length--;
           } else if (editor.cursor_row > 0) {
             int previous_row = editor.cursor_row - 1;
@@ -189,62 +192,59 @@ int main() {
           editor.line_count++;
           editor.cursor_row++;
           editor.cursor_col = 0;
+          editor.preferred_col = 0;
         }
 
         if (event.key.keysym.sym == SDLK_LEFT) {
           if (editor.cursor_col > 0) {
             editor.cursor_col--;
-            cursor_moving = true;
-            cursor_visible = true;
           } else if (editor.cursor_row > 0) {
             editor.cursor_row--;
             editor.cursor_col = editor.lines[editor.cursor_row].length;
-            cursor_moving = true;
-            cursor_visible = true;
           }
+          editor.preferred_col = editor.cursor_col;
+          cursor_moving = true;
+          cursor_visible = true;
         }
 
         if (event.key.keysym.sym == SDLK_RIGHT) {
           if (editor.cursor_col < line->length) {
             editor.cursor_col++;
-            cursor_moving = true;
-            cursor_visible = true;
           } else if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             editor.cursor_col = 0;
-            cursor_moving = true;
-            cursor_visible = true;
           }
+          editor.preferred_col = editor.cursor_col;
+          cursor_moving = true;
+          cursor_visible = true;
         }
 
         if (event.key.keysym.sym == SDLK_UP) {
           if (editor.cursor_row > 0) {
             editor.cursor_row--;
             Line *up_line = &editor.lines[editor.cursor_row];
+            if (up_line->length >= editor.preferred_col) {
+              editor.cursor_col = editor.preferred_col;
+            } else {
+              editor.cursor_col = up_line->length;
+            }
             cursor_moving = true;
             cursor_visible = true;
-            if (editor.cursor_col > up_line->length) {
-              editor.cursor_col = up_line->length;
-              cursor_moving = true;
-              cursor_visible = true;
-            }
           }
         }
-
         if (event.key.keysym.sym == SDLK_DOWN) {
           if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             Line *down_line = &editor.lines[editor.cursor_row];
+            if (down_line->length >= editor.preferred_col) {
+              editor.cursor_col = editor.preferred_col;
+            } else {
+              editor.cursor_col = down_line->length;
+            }
             cursor_moving = true;
             cursor_visible = true;
-            if (editor.cursor_col > down_line->length) {
-              editor.cursor_col = down_line->length;
-              cursor_moving = true;
-              cursor_visible = true;
-            }
           }
         }
-
         break;
       }
 
