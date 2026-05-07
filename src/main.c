@@ -146,142 +146,152 @@ int main() {
       last_blink = SDL_GetTicks();
     }
 
-    {
-      // These are background rendering operations.
-      SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-      SDL_RenderClear(
-          renderer); // Without clearing: deleted characters stay visible
+    // These are background rendering operations.
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderClear(
+        renderer); // Without clearing: deleted characters stay visible
 
-      int x = 20;
-      int y = 40;
-      for (int i = 0; i < text_length; i++) {
-        // FT_Load_Char(...) This is where FreeType converts: character into
-        // bitmap glyph
-        if (FT_Load_Char(face, text[i], FT_LOAD_RENDER)) {
-          SDL_Log("Failed glyph load: %c", text[i]);
-          continue;
-        }
+    int x = 20;
+    int y = 40;
+    for (int i = 0; i < text_length; i++) {
 
-        FT_GlyphSlot glyph = face->glyph;
-        if (glyph->bitmap.width == 0 ||
-            glyph->bitmap.rows == 0) { // For Spaces and Tabs
-
-          // Spacebar and Tab logic
-          if (text[i] == '\t') {
-            x += (glyph->advance.x >> 6) * 4; // Add 4 for Tabs
-          } else {
-            x += glyph->advance.x >> 6; // For SpaceBar
-          }
-          continue;
-
-          if (text[i] == '\n') {
-            y += 40;
-            x = 20;
-            continue;
-          }
-        }
-
-        // Surface is NOT text-editor surface. It is temporary image buffer in
-        // RAM. For each glyph => Character 'A' -> Bitmap -> Surface created for
-        // only 'A' Next character gets another surface.
-        SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
-            0, glyph->bitmap.width, glyph->bitmap.rows, 32,
-            SDL_PIXELFORMAT_RGBA32);
-
-        if (!surface) {
-          continue;
-        }
-
-        // Now we do surface locking because SDL asks you to lock the surface
-        // before directly accessing pixel memory. Some surfaces may internally
-        // store pixels differently or use hardware-managed memory  and use
-        // temporary synchronization mechanisms. Meaning -> "SDL, prepare this
-        // surface so I can safely read/write raw pixels." After locking:
-        // surface->pixels becomes safe to access directly.
-        SDL_LockSurface(surface);
-
-        Uint32 *pixels =
-            (Uint32 *)surface
-                ->pixels; // surface->pixel gives general void* we convert it
-                          // into Uint32 because each pixel is 32 bit.
-        int pitch_pixels =
-            surface->pitch /
-            4; // pitch means actual bytes occupied by one row. Division by 4
-               // because pitch is in bytes but pixel is 32 bit or 4 bytes.
-
-        // Now put FreeStyle bitmap pixels into SDL surface pixel
-        for (unsigned int row = 0; row < glyph->bitmap.rows; row++) {
-          for (unsigned int col = 0; col < glyph->bitmap.width; col++) {
-            unsigned char alpha =
-                glyph->bitmap.buffer[row * glyph->bitmap.pitch + col];
-
-            pixels[row * pitch_pixels + col] =
-                SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
-          }
-        }
-        SDL_UnlockSurface(surface);
-
-        // Surface is CPU memory. GPU can't efficiently render surface. So SDL
-        // convert Suface(RAM) to Texture (GPU memory). Textures are optimized
-        // for rendering speed.
-        SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
-        if (!texture) {
-          SDL_Log("Texture Creation Failed: %s", SDL_GetError());
-          SDL_FreeSurface(surface);
-          continue;
-        }
-        SDL_SetTextureBlendMode(
-            texture, SDL_BLENDMODE_BLEND); // Enables transparency. Use alpha
-                                           // blending while drawing texture
-
-        if (!texture) {
-          SDL_Log("Texture Creation Failed: %s", SDL_GetError());
-          SDL_FreeSurface(surface);
-          continue;
-        }
-
-        SDL_Rect dst = {
-            x + glyph->bitmap_left, y - glyph->bitmap_top, glyph->bitmap.width,
-            glyph->bitmap.rows}; // Horizontal, Vertical, Width, Height
-
-        if (SDL_RenderCopy(renderer, texture, NULL, &dst) != 0) {
-          // Copies texture onto renderer.
-          SDL_Log("RenderCopy Failed: %s", SDL_GetError());
-        }
-
-        x += glyph->advance.x >>
-             6; // Moves cursor for next character. FreeType store values in
-                // 1/64 pixel precision. So divide by 64 to get real pixel value
-
-        SDL_DestroyTexture(texture); // Avoid GPU memory leak
-        SDL_FreeSurface(surface);    // CPU side image buffer. Avoid RAM leak
+      // Spacebar and Tab logic
+      if (text[i] == '\t') {
+        x += 64; // Add 4 for Tabs -> 16*4
+        continue;
+      }
+      if (text[i] == '\n') {
+        y += 40;
+        x = 20;
+        continue;
+      }
+      if (text[i] == ' ') {
+        x += 16; // For SpaceBar
+        continue;
       }
 
-      int cursor_x = 20;
-      for (int i = 0; i < cursor_position; i++) {
-        if (FT_Load_Char(face, text[i], FT_LOAD_RENDER)) {
-          continue;
-        }
-        if (text[i] == '\t') {
-          cursor_x += (face->glyph->advance.x >> 6) * 4;
-        } else {
-          cursor_x += face->glyph->advance.x >> 6;
-        }
+      // FT_Load_Char(...) This is where FreeType converts: character into
+      // bitmap glyph
+      if (FT_Load_Char(face, text[i], FT_LOAD_RENDER)) {
+        SDL_Log("Failed glyph load: %c", text[i]);
+        continue;
       }
-      SDL_Rect cursor = {cursor_x, 16, 2, 24};
-      // font size is: FT_Set_Pixel_Sizes(face, 0, 24).Cursor height should
-      // visually match glyph height.
 
-      if (cursor_visible) {
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255,
-                               255); // Sets drawing color to white.
-        SDL_RenderFillRect(renderer, &cursor);
-        // Draws solid rectangle. That will be the cursor.
-        // Everything until now was drawn in hidden backbuffer. Now show
-        // completed frame on actual screen
+      FT_GlyphSlot glyph = face->glyph;
+
+      // Surface is NOT text-editor surface. It is temporary image buffer in
+      // RAM. For each glyph => Character 'A' -> Bitmap -> Surface created for
+      // only 'A' Next character gets another surface.
+      SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
+          0, glyph->bitmap.width, glyph->bitmap.rows, 32,
+          SDL_PIXELFORMAT_RGBA32);
+
+      if (!surface) {
+        continue;
       }
-      SDL_RenderPresent(renderer);
+
+      // Now we do surface locking because SDL asks you to lock the surface
+      // before directly accessing pixel memory. Some surfaces may internally
+      // store pixels differently or use hardware-managed memory  and use
+      // temporary synchronization mechanisms. Meaning -> "SDL, prepare this
+      // surface so I can safely read/write raw pixels." After locking:
+      // surface->pixels becomes safe to access directly.
+      SDL_LockSurface(surface);
+
+      Uint32 *pixels =
+          (Uint32 *)
+              surface->pixels; // surface->pixel gives general void* we convert
+                               // it into Uint32 because each pixel is 32 bit.
+      int pitch_pixels =
+          surface->pitch /
+          4; // pitch means actual bytes occupied by one row. Division by 4
+             // because pitch is in bytes but pixel is 32 bit or 4 bytes.
+
+      // Now put FreeStyle bitmap pixels into SDL surface pixel
+      for (unsigned int row = 0; row < glyph->bitmap.rows; row++) {
+        for (unsigned int col = 0; col < glyph->bitmap.width; col++) {
+          unsigned char alpha =
+              glyph->bitmap.buffer[row * glyph->bitmap.pitch + col];
+
+          pixels[row * pitch_pixels + col] =
+              SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
+        }
+      }
+      SDL_UnlockSurface(surface);
+
+      // Surface is CPU memory. GPU can't efficiently render surface. So SDL
+      // convert Suface(RAM) to Texture (GPU memory). Textures are optimized
+      // for rendering speed.
+      SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+      if (!texture) {
+        SDL_Log("Texture Creation Failed: %s", SDL_GetError());
+        SDL_FreeSurface(surface);
+        continue;
+      }
+      SDL_SetTextureBlendMode(
+          texture, SDL_BLENDMODE_BLEND); // Enables transparency. Use alpha
+                                         // blending while drawing texture
+
+      if (!texture) {
+        SDL_Log("Texture Creation Failed: %s", SDL_GetError());
+        SDL_FreeSurface(surface);
+        continue;
+      }
+
+      SDL_Rect dst = {
+          x + glyph->bitmap_left, y - glyph->bitmap_top, glyph->bitmap.width,
+          glyph->bitmap.rows}; // Horizontal, Vertical, Width, Height
+
+      if (SDL_RenderCopy(renderer, texture, NULL, &dst) != 0) {
+        // Copies texture onto renderer.
+        SDL_Log("RenderCopy Failed: %s", SDL_GetError());
+      }
+
+      x += glyph->advance.x >>
+           6; // Moves cursor for next character. FreeType store values in
+              // 1/64 pixel precision. So divide by 64 to get real pixel value
+
+      SDL_DestroyTexture(texture); // Avoid GPU memory leak
+      SDL_FreeSurface(surface);    // CPU side image buffer. Avoid RAM leak
     }
+
+    // Cursor Logic
+    int cursor_x = 20;
+    int cursor_y = 40;
+    for (int i = 0; i < cursor_position; i++) {
+      if (text[i] == '\n') {
+        cursor_y += 40;
+        cursor_x = 20;
+        continue;
+      }
+      if (text[i] == '\t') {
+        cursor_x += 64;
+        continue;
+      }
+      if (text[i] == ' ') {
+        cursor_x += 16;
+        continue;
+      }
+      if (FT_Load_Char(face, text[i], FT_LOAD_RENDER)) {
+        continue;
+      }
+      cursor_x += face->glyph->advance.x >> 6;
+    }
+    SDL_Rect cursor = {cursor_x, cursor_y - 24, 2,
+                       24}; // font size is: FT_Set_Pixel_Sizes(face, 0,
+                            // 24).Cursor height should
+    // visually match glyph height.
+
+    if (cursor_visible) {
+      SDL_SetRenderDrawColor(renderer, 255, 255, 255,
+                             255); // Sets drawing color to white.
+      SDL_RenderFillRect(renderer, &cursor);
+      // Draws solid rectangle. That will be the cursor.
+      // Everything until now was drawn in hidden backbuffer. Now show
+      // completed frame on actual screen
+    }
+    SDL_RenderPresent(renderer);
+
     SDL_Delay(1); // Prevents infinite loop from consuming 100% CPU.
   }
 
