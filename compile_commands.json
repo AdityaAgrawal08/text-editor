@@ -1,0 +1,59 @@
+[
+  {
+    "file": "src/editor.c",
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Iinclude",
+      "-I/usr/include/SDL2",
+      "-D_GNU_SOURCE=1",
+      "-D_REENTRANT",
+      "-I/usr/include/freetype2",
+      "-I/usr/include/libpng16",
+      "src/editor.c",
+      "-o",
+      "build/editor"
+    ],
+    "directory": "/home/aditya/code/text-editor",
+    "output": "build/editor"
+  },
+  {
+    "file": "src/main.c",
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Iinclude",
+      "-I/usr/include/SDL2",
+      "-D_GNU_SOURCE=1",
+      "-D_REENTRANT",
+      "-I/usr/include/freetype2",
+      "-I/usr/include/libpng16",
+      "src/main.c",
+      "-o",
+      "build/editor"
+    ],
+    "directory": "/home/aditya/code/text-editor",
+    "output": "build/editor"
+  },
+  {
+    "file": "src/render.c",
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Iinclude",
+      "-I/usr/include/SDL2",
+      "-D_GNU_SOURCE=1",
+      "-D_REENTRANT",
+      "-I/usr/include/freetype2",
+      "-I/usr/include/libpng16",
+      "src/render.c",
+      "-o",
+      "build/editor"
+    ],
+    "directory": "/home/aditya/code/text-editor",
+    "output": "build/editor"
+  }
+]
