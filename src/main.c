@@ -19,7 +19,8 @@ typedef struct {
   int line_capacity;
   int cursor_row;
   int cursor_col;
-  int preferred_col;
+  int preferred_x;
+  Uint32 last_vertical_move;
 } Editor;
 
 void line_init(Line *line) {
@@ -41,6 +42,45 @@ void line_insert_char(Line *line, int index, char c) {
   memmove(&line->data[index + 1], &line->data[index], line->length - index + 1);
   line->data[index] = c;
   line->length++;
+}
+
+int get_line_x_position(FT_Face face, Line *line, int col) {
+  int x = 20;
+  for (int i = 0; i < col; i++) {
+    char c = line->data[i];
+    if (c == ' ') {
+      x += 16;
+      continue;
+    }
+    if (c == '\t') {
+      x += 64;
+      continue;
+    }
+    if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+      continue;
+    }
+    x += face->glyph->advance.x >> 6;
+  }
+  return x;
+}
+
+int get_closest_column(FT_Face face, Line *line, int target_x) {
+  int best_col = 0;
+  int best_distance = 999999;
+  for (int col = 0; col <= line->length; col++) {
+    int current_x = get_line_x_position(face, line, col);
+    int distance = abs(current_x - target_x);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_col = col;
+    }
+  }
+  return best_col;
+}
+
+void refresh_preferred_x(Editor *editor, FT_Face face) {
+  editor->preferred_x = get_line_x_position(
+      face, &editor->lines[editor->cursor_row], editor->cursor_col);
 }
 
 int main() {
@@ -97,13 +137,14 @@ int main() {
   FT_Set_Pixel_Sizes(face, 0, 24);
   SDL_StartTextInput();
   Editor editor;
+  editor.last_vertical_move = 0;
   editor.line_capacity = 16;
   editor.line_count = 1;
   editor.lines = malloc(sizeof(Line) * editor.line_capacity);
   line_init(&editor.lines[0]);
   editor.cursor_row = 0;
   editor.cursor_col = 0;
-  editor.preferred_col = 0;
+  editor.preferred_x = 20;
   bool running = true;
 
   Uint32 last_blink = SDL_GetTicks();
@@ -122,7 +163,8 @@ int main() {
         Line *line = &editor.lines[editor.cursor_row];
         line_insert_char(line, editor.cursor_col, event.text.text[0]);
         editor.cursor_col++;
-        editor.preferred_col = editor.cursor_col;
+        editor.preferred_x = get_line_x_position(
+            face, &editor.lines[editor.cursor_row], editor.cursor_col);
         break;
       }
 
@@ -134,7 +176,8 @@ int main() {
                     &line->data[editor.cursor_col],
                     line->length - editor.cursor_col + 1);
             editor.cursor_col--;
-            editor.preferred_col = editor.cursor_col;
+            editor.preferred_x = get_line_x_position(
+                face, &editor.lines[editor.cursor_row], editor.cursor_col);
             line->length--;
           } else if (editor.cursor_row > 0) {
             int previous_row = editor.cursor_row - 1;
@@ -192,7 +235,7 @@ int main() {
           editor.line_count++;
           editor.cursor_row++;
           editor.cursor_col = 0;
-          editor.preferred_col = 0;
+          editor.preferred_x = 20;
         }
 
         if (event.key.keysym.sym == SDLK_LEFT) {
@@ -202,7 +245,8 @@ int main() {
             editor.cursor_row--;
             editor.cursor_col = editor.lines[editor.cursor_row].length;
           }
-          editor.preferred_col = editor.cursor_col;
+          editor.preferred_x = get_line_x_position(
+              face, &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -214,33 +258,39 @@ int main() {
             editor.cursor_row++;
             editor.cursor_col = 0;
           }
-          editor.preferred_col = editor.cursor_col;
+          editor.preferred_x = get_line_x_position(
+              face, &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
 
         if (event.key.keysym.sym == SDLK_UP) {
+          Uint32 now = SDL_GetTicks();
+          if (now - editor.last_vertical_move > 2000) {
+            refresh_preferred_x(&editor, face);
+          }
+          editor.last_vertical_move = now;
           if (editor.cursor_row > 0) {
             editor.cursor_row--;
             Line *up_line = &editor.lines[editor.cursor_row];
-            if (up_line->length >= editor.preferred_col) {
-              editor.cursor_col = editor.preferred_col;
-            } else {
-              editor.cursor_col = up_line->length;
-            }
+            editor.cursor_col =
+                get_closest_column(face, up_line, editor.preferred_x);
             cursor_moving = true;
             cursor_visible = true;
           }
         }
+
         if (event.key.keysym.sym == SDLK_DOWN) {
+          Uint32 now = SDL_GetTicks();
+          if (now - editor.last_vertical_move > 2000) {
+            refresh_preferred_x(&editor, face);
+          }
+          editor.last_vertical_move = now;
           if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             Line *down_line = &editor.lines[editor.cursor_row];
-            if (down_line->length >= editor.preferred_col) {
-              editor.cursor_col = editor.preferred_col;
-            } else {
-              editor.cursor_col = down_line->length;
-            }
+            editor.cursor_col =
+                get_closest_column(face, down_line, editor.preferred_x);
             cursor_moving = true;
             cursor_visible = true;
           }
