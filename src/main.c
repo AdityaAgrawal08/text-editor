@@ -1,11 +1,87 @@
 #include "SDL_keycode.h"
-#include <SDL2/SDL.h> //Simple DirectMedia Layer
-#include <ft2build.h> //FreeType
+#include <SDL2/SDL.h>
+#include <ft2build.h>
 #include <stdbool.h>
 #include FT_FREETYPE_H
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef struct {
+  char *data;
+  int length;
+  int capacity;
+} Line;
+
+typedef struct {
+  Line *lines;
+  int line_count;
+  int line_capacity;
+  int cursor_row;
+  int cursor_col;
+  int preferred_x;
+  Uint32 last_vertical_move;
+} Editor;
+
+void line_init(Line *line) {
+  line->capacity = 32;
+  line->length = 0;
+  line->data = malloc(line->capacity);
+  line->data[0] = '\0';
+}
+
+void line_expand(Line *line) {
+  line->capacity *= 2;
+  line->data = realloc(line->data, line->capacity);
+}
+
+void line_insert_char(Line *line, int index, char c) {
+  if (line->length + 1 >= line->capacity) {
+    line_expand(line);
+  }
+  memmove(&line->data[index + 1], &line->data[index], line->length - index + 1);
+  line->data[index] = c;
+  line->length++;
+}
+
+int get_line_x_position(FT_Face face, Line *line, int col) {
+  int x = 80;
+  for (int i = 0; i < col; i++) {
+    char c = line->data[i];
+    if (c == ' ') {
+      x += 16;
+      continue;
+    }
+    if (c == '\t') {
+      x += 64;
+      continue;
+    }
+    if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+      continue;
+    }
+    x += face->glyph->advance.x >> 6;
+  }
+  return x;
+}
+
+int get_closest_column(FT_Face face, Line *line, int target_x) {
+  int best_col = 0;
+  int best_distance = 999999;
+  for (int col = 0; col <= line->length; col++) {
+    int current_x = get_line_x_position(face, line, col);
+    int distance = abs(current_x - target_x);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_col = col;
+    }
+  }
+  return best_col;
+}
+
+void refresh_preferred_x(Editor *editor, FT_Face face) {
+  editor->preferred_x = get_line_x_position(
+      face, &editor->lines[editor->cursor_row], editor->cursor_col);
+}
 
 int main() {
 
@@ -26,9 +102,6 @@ int main() {
 
   SDL_Renderer *renderer = SDL_CreateRenderer(
       window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-  // -1 is the Driver Index. It automatically choose best rendering driver
-  // use GPU acceleration if possible
-
   if (!renderer) {
     SDL_Log("Renderer Creation Failed: %s", SDL_GetError());
     SDL_DestroyWindow(window);
@@ -36,19 +109,15 @@ int main() {
     return 1;
   }
 
-  // Equivalent conceptually to: SDL_Init(...) but for fonts.
   FT_Library ft;
   if (FT_Init_FreeType(&ft)) {
     SDL_Log("Failed to initialize FreeType");
     return 1;
   }
 
-  // Loads actual .ttf font file."assets/font.ttf is the actual path to font
-  // size and &face -> FreeType writes loaded font object here.
   FT_Face face;
   const char *font_paths[] = {"assets/font.ttf", "../assets/font.ttf"};
   int font_loaded = 0;
-
   for (int i = 0; i < (int)(sizeof(font_paths) / sizeof(font_paths[0])); i++) {
     if (FT_New_Face(ft, font_paths[i], 0, &face) == 0) {
       font_loaded = 1;
@@ -57,7 +126,7 @@ int main() {
   }
 
   if (!font_loaded) {
-    SDL_Log("Failed to load font from assets/font.ttf or ../assets/font.ttf");
+    SDL_Log("Failed to load font");
     FT_Done_FreeType(ft);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
@@ -65,242 +134,334 @@ int main() {
     return 1;
   }
 
-  // Sets glyph render size.
   FT_Set_Pixel_Sizes(face, 0, 24);
-
   SDL_StartTextInput();
+  Editor editor;
+  editor.last_vertical_move = 0;
+  editor.line_capacity = 16;
+  editor.line_count = 1;
+  editor.lines = malloc(sizeof(Line) * editor.line_capacity);
+  line_init(&editor.lines[0]);
+  editor.cursor_row = 0;
+  editor.cursor_col = 0;
+  editor.preferred_x = 20;
   bool running = true;
-  char text[1024] = {};
-  int text_length = 0;
-  int cursor_position = 0;
 
   Uint32 last_blink = SDL_GetTicks();
   bool cursor_visible = true;
+  bool cursor_moving = false;
+
   while (running) {
     SDL_Event event;
-
-    while (SDL_PollEvent(&event)) { // SDL internally already maintains queue.
-                                    // Poll Event Fetch next event from queue
+    while (SDL_PollEvent(&event)) {
       switch (event.type) {
       case SDL_QUIT:
         running = false;
         break;
-      case SDL_TEXTINPUT: // Supports insertion in middle which shifts text
-                          // safely.
-        if (text_length < (int)sizeof(text) - 1) {
-          memmove(&text[cursor_position + 1], &text[cursor_position],
-                  text_length - cursor_position + 1);
-          text[cursor_position] = event.text.text[0];
-          cursor_position++;
-          text_length++;
-        }
+
+      case SDL_TEXTINPUT: {
+        Line *line = &editor.lines[editor.cursor_row];
+        line_insert_char(line, editor.cursor_col, event.text.text[0]);
+        editor.cursor_col++;
+        editor.preferred_x = get_line_x_position(
+            face, &editor.lines[editor.cursor_row], editor.cursor_col);
         break;
-      case SDL_KEYDOWN:
-        if (event.key.keysym.sym == SDLK_BACKSPACE && cursor_position > 0) {
-          memmove(&text[cursor_position - 1], &text[cursor_position],
-                  text_length - cursor_position + 1);
-          cursor_position--;
-          text_length--;
+      }
+
+      case SDL_KEYDOWN: {
+        Line *line = &editor.lines[editor.cursor_row];
+        if (event.key.keysym.sym == SDLK_BACKSPACE) {
+          if (editor.cursor_col > 0) {
+            memmove(&line->data[editor.cursor_col - 1],
+                    &line->data[editor.cursor_col],
+                    line->length - editor.cursor_col + 1);
+            editor.cursor_col--;
+            editor.preferred_x = get_line_x_position(
+                face, &editor.lines[editor.cursor_row], editor.cursor_col);
+            line->length--;
+          } else if (editor.cursor_row > 0) {
+            int previous_row = editor.cursor_row - 1;
+            Line *previous = &editor.lines[previous_row];
+            int old_length = previous->length;
+
+            while (previous->length + line->length + 1 >= previous->capacity) {
+              line_expand(previous);
+            }
+
+            memcpy(&previous->data[previous->length], line->data,
+                   line->length + 1);
+            previous->length += line->length;
+            free(line->data);
+
+            for (int i = editor.cursor_row; i < editor.line_count - 1; i++) {
+              editor.lines[i] = editor.lines[i + 1];
+            }
+            editor.line_count--;
+            editor.cursor_row--;
+            editor.cursor_col = old_length;
+          }
         }
 
         if (event.key.keysym.sym == SDLK_TAB) {
-          if (text_length < (int)sizeof(text) - 1) {
-            memmove(&text[cursor_position + 1], &text[cursor_position],
-                    text_length - cursor_position + 1);
-            text[cursor_position] = '\t';
-            cursor_position++;
-            text_length++;
+          for (int i = 0; i < 4; i++) {
+            line_insert_char(line, editor.cursor_col, ' ');
+            editor.cursor_col++;
           }
-        }
-
-        if (event.key.keysym.sym == SDLK_LEFT && cursor_position > 0) {
-          cursor_position--;
-        }
-
-        if (event.key.keysym.sym == SDLK_RIGHT &&
-            cursor_position < text_length) {
-          cursor_position++;
         }
 
         if (event.key.keysym.sym == SDLK_RETURN) {
-          if (text_length < (int)sizeof(text) - 1) {
-            memmove(&text[cursor_position + 1], &text[cursor_position],
-                    text_length - cursor_position + 1);
+          if (editor.line_count + 1 >= editor.line_capacity) {
+            editor.line_capacity *= 2;
+            editor.lines =
+                realloc(editor.lines, sizeof(Line) * editor.line_capacity);
+          }
+          for (int i = editor.line_count; i > editor.cursor_row + 1; i--) {
+            editor.lines[i] = editor.lines[i - 1];
+          }
+          Line new_line;
+          line_init(&new_line);
+          int split_length = line->length - editor.cursor_col;
 
-            text[cursor_position] = '\n';
-            cursor_position++;
-            text_length++;
+          while (new_line.capacity <= split_length) {
+            line_expand(&new_line);
+          }
+
+          memcpy(new_line.data, &line->data[editor.cursor_col], split_length);
+          new_line.length = split_length;
+          new_line.data[split_length] = '\0';
+          line->length = editor.cursor_col;
+          line->data[line->length] = '\0';
+          editor.lines[editor.cursor_row + 1] = new_line;
+          editor.line_count++;
+          editor.cursor_row++;
+          editor.cursor_col = 0;
+          editor.preferred_x = 20;
+        }
+
+        if (event.key.keysym.sym == SDLK_LEFT) {
+          if (editor.cursor_col > 0) {
+            editor.cursor_col--;
+          } else if (editor.cursor_row > 0) {
+            editor.cursor_row--;
+            editor.cursor_col = editor.lines[editor.cursor_row].length;
+          }
+          editor.preferred_x = get_line_x_position(
+              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+          cursor_moving = true;
+          cursor_visible = true;
+        }
+
+        if (event.key.keysym.sym == SDLK_RIGHT) {
+          if (editor.cursor_col < line->length) {
+            editor.cursor_col++;
+          } else if (editor.cursor_row < editor.line_count - 1) {
+            editor.cursor_row++;
+            editor.cursor_col = 0;
+          }
+          editor.preferred_x = get_line_x_position(
+              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+          cursor_moving = true;
+          cursor_visible = true;
+        }
+
+        if (event.key.keysym.sym == SDLK_UP) {
+          Uint32 now = SDL_GetTicks();
+          if (now - editor.last_vertical_move > 2000) {
+            refresh_preferred_x(&editor, face);
+          }
+          editor.last_vertical_move = now;
+          if (editor.cursor_row > 0) {
+            editor.cursor_row--;
+            Line *up_line = &editor.lines[editor.cursor_row];
+            editor.cursor_col =
+                get_closest_column(face, up_line, editor.preferred_x);
+            cursor_moving = true;
+            cursor_visible = true;
           }
         }
 
-        break;
-
-      case SDL_WINDOWEVENT:
-        break;
-      }
-    }
-
-    // Add cursor blinking.
-    if (SDL_GetTicks() - last_blink >= 500) {
-      cursor_visible = !cursor_visible;
-      last_blink = SDL_GetTicks();
-    }
-
-    // These are background rendering operations.
-    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-    SDL_RenderClear(
-        renderer); // Without clearing: deleted characters stay visible
-
-    int x = 20;
-    int y = 40;
-    for (int i = 0; i < text_length; i++) {
-
-      // Spacebar and Tab logic
-      if (text[i] == '\t') {
-        x += 64; // Add 4 for Tabs -> 16*4
-        continue;
-      }
-      if (text[i] == '\n') {
-        y += 40;
-        x = 20;
-        continue;
-      }
-      if (text[i] == ' ') {
-        x += 16; // For SpaceBar
-        continue;
-      }
-
-      // FT_Load_Char(...) This is where FreeType converts: character into
-      // bitmap glyph
-      if (FT_Load_Char(face, text[i], FT_LOAD_RENDER)) {
-        SDL_Log("Failed glyph load: %c", text[i]);
-        continue;
-      }
-
-      FT_GlyphSlot glyph = face->glyph;
-
-      // Surface is NOT text-editor surface. It is temporary image buffer in
-      // RAM. For each glyph => Character 'A' -> Bitmap -> Surface created for
-      // only 'A' Next character gets another surface.
-      SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
-          0, glyph->bitmap.width, glyph->bitmap.rows, 32,
-          SDL_PIXELFORMAT_RGBA32);
-
-      if (!surface) {
-        continue;
-      }
-
-      // Now we do surface locking because SDL asks you to lock the surface
-      // before directly accessing pixel memory. Some surfaces may internally
-      // store pixels differently or use hardware-managed memory  and use
-      // temporary synchronization mechanisms. Meaning -> "SDL, prepare this
-      // surface so I can safely read/write raw pixels." After locking:
-      // surface->pixels becomes safe to access directly.
-      SDL_LockSurface(surface);
-
-      Uint32 *pixels =
-          (Uint32 *)
-              surface->pixels; // surface->pixel gives general void* we convert
-                               // it into Uint32 because each pixel is 32 bit.
-      int pitch_pixels =
-          surface->pitch /
-          4; // pitch means actual bytes occupied by one row. Division by 4
-             // because pitch is in bytes but pixel is 32 bit or 4 bytes.
-
-      // Now put FreeStyle bitmap pixels into SDL surface pixel
-      for (unsigned int row = 0; row < glyph->bitmap.rows; row++) {
-        for (unsigned int col = 0; col < glyph->bitmap.width; col++) {
-          unsigned char alpha =
-              glyph->bitmap.buffer[row * glyph->bitmap.pitch + col];
-
-          pixels[row * pitch_pixels + col] =
-              SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
+        if (event.key.keysym.sym == SDLK_DOWN) {
+          Uint32 now = SDL_GetTicks();
+          if (now - editor.last_vertical_move > 2000) {
+            refresh_preferred_x(&editor, face);
+          }
+          editor.last_vertical_move = now;
+          if (editor.cursor_row < editor.line_count - 1) {
+            editor.cursor_row++;
+            Line *down_line = &editor.lines[editor.cursor_row];
+            editor.cursor_col =
+                get_closest_column(face, down_line, editor.preferred_x);
+            cursor_moving = true;
+            cursor_visible = true;
+          }
         }
-      }
-      SDL_UnlockSurface(surface);
-
-      // Surface is CPU memory. GPU can't efficiently render surface. So SDL
-      // convert Suface(RAM) to Texture (GPU memory). Textures are optimized
-      // for rendering speed.
-      SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
-      if (!texture) {
-        SDL_Log("Texture Creation Failed: %s", SDL_GetError());
-        SDL_FreeSurface(surface);
-        continue;
-      }
-      SDL_SetTextureBlendMode(
-          texture, SDL_BLENDMODE_BLEND); // Enables transparency. Use alpha
-                                         // blending while drawing texture
-
-      if (!texture) {
-        SDL_Log("Texture Creation Failed: %s", SDL_GetError());
-        SDL_FreeSurface(surface);
-        continue;
+        break;
       }
 
-      SDL_Rect dst = {
-          x + glyph->bitmap_left, y - glyph->bitmap_top, glyph->bitmap.width,
-          glyph->bitmap.rows}; // Horizontal, Vertical, Width, Height
-
-      if (SDL_RenderCopy(renderer, texture, NULL, &dst) != 0) {
-        // Copies texture onto renderer.
-        SDL_Log("RenderCopy Failed: %s", SDL_GetError());
+      default:
+        break;
       }
-
-      x += glyph->advance.x >>
-           6; // Moves cursor for next character. FreeType store values in
-              // 1/64 pixel precision. So divide by 64 to get real pixel value
-
-      SDL_DestroyTexture(texture); // Avoid GPU memory leak
-      SDL_FreeSurface(surface);    // CPU side image buffer. Avoid RAM leak
     }
 
-    // Cursor Logic
-    int cursor_x = 20;
-    int cursor_y = 40;
-    for (int i = 0; i < cursor_position; i++) {
-      if (text[i] == '\n') {
-        cursor_y += 40;
-        cursor_x = 20;
-        continue;
+    if (!cursor_moving) {
+      if (SDL_GetTicks() - last_blink >= 500) {
+        cursor_visible = !cursor_visible;
+        last_blink = SDL_GetTicks();
       }
-      if (text[i] == '\t') {
-        cursor_x += 64;
-        continue;
+    } else {
+      last_blink = SDL_GetTicks();
+      cursor_visible = true;
+    }
+
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderClear(renderer);
+
+    int y = 40;
+    for (int row = 0; row < editor.line_count; row++) {
+      char line_number_text[16];
+      if (row == editor.cursor_row) {
+        snprintf(line_number_text, sizeof(line_number_text), "%d", row + 1);
+      } else {
+        snprintf(line_number_text, sizeof(line_number_text), "%d",
+                 abs(row - editor.cursor_row));
       }
-      if (text[i] == ' ') {
+
+      int number_x = 20;
+      for (int i = 0; line_number_text[i] != '\0'; i++) {
+        if (FT_Load_Char(face, line_number_text[i], FT_LOAD_RENDER)) {
+          continue;
+        }
+
+        FT_GlyphSlot glyph = face->glyph;
+        SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
+            0, glyph->bitmap.width, glyph->bitmap.rows, 32,
+            SDL_PIXELFORMAT_RGBA32);
+
+        if (!surface) {
+          continue;
+        }
+
+        SDL_LockSurface(surface);
+        Uint8 r = 120;
+        Uint8 g = 120;
+        Uint8 b = 120;
+        if (row == editor.cursor_row) {
+          r = 255;
+          g = 200;
+          b = 60;
+        }
+        Uint32 *pixels = (Uint32 *)surface->pixels;
+        int pitch_pixels = surface->pitch / 4;
+        for (unsigned int gy = 0; gy < glyph->bitmap.rows; gy++) {
+          for (unsigned int gx = 0; gx < glyph->bitmap.width; gx++) {
+            unsigned char alpha =
+                glyph->bitmap.buffer[gy * glyph->bitmap.pitch + gx];
+            pixels[gy * pitch_pixels + gx] =
+                SDL_MapRGBA(surface->format, r, g, b, alpha);
+          }
+        }
+
+        SDL_UnlockSurface(surface);
+        SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        SDL_Rect dst = {number_x + glyph->bitmap_left, y - glyph->bitmap_top,
+                        glyph->bitmap.width, glyph->bitmap.rows};
+
+        SDL_RenderCopy(renderer, texture, NULL, &dst);
+        number_x += glyph->advance.x >> 6;
+        SDL_DestroyTexture(texture);
+        SDL_FreeSurface(surface);
+      }
+
+      Line *line = &editor.lines[row];
+      int x = 80;
+      for (int col = 0; col < line->length; col++) {
+        char c = line->data[col];
+        if (c == ' ') {
+          x += 16;
+          continue;
+        }
+        if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+          continue;
+        }
+
+        FT_GlyphSlot glyph = face->glyph;
+        SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(
+            0, glyph->bitmap.width, glyph->bitmap.rows, 32,
+            SDL_PIXELFORMAT_RGBA32);
+
+        if (!surface) {
+          continue;
+        }
+
+        SDL_LockSurface(surface);
+        Uint32 *pixels = (Uint32 *)surface->pixels;
+        int pitch_pixels = surface->pitch / 4;
+        for (unsigned int gy = 0; gy < glyph->bitmap.rows; gy++) {
+          for (unsigned int gx = 0; gx < glyph->bitmap.width; gx++) {
+            unsigned char alpha =
+                glyph->bitmap.buffer[gy * glyph->bitmap.pitch + gx];
+            pixels[gy * pitch_pixels + gx] =
+                SDL_MapRGBA(surface->format, 255, 255, 255, alpha);
+          }
+        }
+
+        SDL_UnlockSurface(surface);
+        SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+
+        if (!texture) {
+          SDL_FreeSurface(surface);
+          continue;
+        }
+
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        SDL_Rect dst = {x + glyph->bitmap_left, y - glyph->bitmap_top,
+                        glyph->bitmap.width, glyph->bitmap.rows};
+        SDL_RenderCopy(renderer, texture, NULL, &dst);
+        x += glyph->advance.x >> 6;
+        SDL_DestroyTexture(texture);
+        SDL_FreeSurface(surface);
+      }
+      y += 40;
+    }
+
+    int cursor_x = 80;
+    int cursor_y = 40 + (editor.cursor_row * 40);
+    Line *cursor_line = &editor.lines[editor.cursor_row];
+
+    for (int i = 0; i < editor.cursor_col; i++) {
+      char c = cursor_line->data[i];
+      if (c == ' ') {
         cursor_x += 16;
         continue;
       }
-      if (FT_Load_Char(face, text[i], FT_LOAD_RENDER)) {
+
+      if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
         continue;
       }
       cursor_x += face->glyph->advance.x >> 6;
     }
-    SDL_Rect cursor = {cursor_x, cursor_y - 24, 2,
-                       24}; // font size is: FT_Set_Pixel_Sizes(face, 0,
-                            // 24).Cursor height should
-    // visually match glyph height.
 
+    SDL_Rect cursor = {cursor_x, cursor_y - 20, 2, 28};
     if (cursor_visible) {
-      SDL_SetRenderDrawColor(renderer, 255, 255, 255,
-                             255); // Sets drawing color to white.
+      SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
       SDL_RenderFillRect(renderer, &cursor);
-      // Draws solid rectangle. That will be the cursor.
-      // Everything until now was drawn in hidden backbuffer. Now show
-      // completed frame on actual screen
     }
-    SDL_RenderPresent(renderer);
 
-    SDL_Delay(1); // Prevents infinite loop from consuming 100% CPU.
+    SDL_RenderPresent(renderer);
+    SDL_Delay(1);
   }
 
+  for (int i = 0; i < editor.line_count; i++) {
+    free(editor.lines[i].data);
+  }
+
+  free(editor.lines);
   SDL_StopTextInput();
-  FT_Done_Face(face);   // Prevents memory/resource leaks during shutdown.
-  FT_Done_FreeType(ft); // Prevents memory/resource leaks during shutdown.
+  FT_Done_Face(face);
+  FT_Done_FreeType(ft);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
   SDL_Quit();
-
   return 0;
 }
