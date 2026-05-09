@@ -1,18 +1,20 @@
-#include "SDL_keycode.h"
-#include <SDL2/SDL.h>
-#include <ft2build.h>
+#include "SDL_keycode.h" //keyboard key constants used for event handling
+#include <SDL2/SDL.h>    //Simple DirectMedia Layer
+#include <ft2build.h>    //FreeType
 #include <stdbool.h>
 #include FT_FREETYPE_H
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// Line Structure
 typedef struct {
   char *data;
   int length;
   int capacity;
 } Line;
 
+// Editor Structure
 typedef struct {
   Line *lines;
   int line_count;
