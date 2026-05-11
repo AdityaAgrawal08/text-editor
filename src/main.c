@@ -11,6 +11,7 @@
 // Line Structure
 typedef struct {
   char *data;
+  int *advance_cache;
   int length;
   int capacity;
 } Line;
@@ -30,10 +31,12 @@ typedef struct {
 } Editor;
 
 void line_init(Line *line) {
-  line->data = malloc(line->capacity);
-  line->data[0] = '\0';
-  line->length = 0;
   line->capacity = 32;
+  line->length = 0;
+  line->data = malloc(line->capacity);
+  line->advance_cache = malloc(sizeof(int) * line->capacity);
+  line->data[0] = '\0';
+  line->advance_cache[0] = 80;
 }
 
 bool line_expand(Line *line) {
@@ -43,7 +46,13 @@ bool line_expand(Line *line) {
     fprintf(stderr, "Failed to expand line buffer\n");
     return false;
   }
+
+  int *new_cache = realloc(line->advance_cache, sizeof(int) * new_capacity);
+  if (!new_cache) {
+    return false;
+  }
   line->data = new_data;
+  line->advance_cache = new_cache;
   line->capacity = new_capacity;
   return true;
 }
@@ -56,7 +65,6 @@ void line_insert_char(Line *line, int index, char c) {
       fprintf(stderr, "Failed to expand line buffer\n");
       return;
     }
-    line_expand(line);
   }
   memmove(&line->data[index + 1], &line->data[index], line->length - index + 1);
   line->data[index] = c;
@@ -69,36 +77,16 @@ void line_insert_char(Line *line, int index, char c) {
 // The editor internally stores cursor as: cursor_row, cursor_col, But rendering
 // works in: pixel coordinates. So the editor constantly converts: text position
 // to screen position This phase handles that conversion.
-int get_line_x_position(FT_Face face, Line *line, int col) {
-  int x = 80;
-  for (int i = 0; i < col; i++) {
-    char c = line->data[i];
-    if (c == ' ') {
-      x += 16;
-      continue;
-    }
-    if (c == '\t') {
-      x += 64;
-      continue;
-    }
-
-    // Future Implementations: Use tab stops, or align tabs to columns, or
-    // compute nearest tab boundary.
-
-    if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
-      continue; // Find glyph, rasterizes bitmap, populates glyph slot.
-    }
-    x += face->glyph->advance.x >> 6;
-  }
-  return x; // pixel x-coordinate of cursor at given column
+int get_line_x_position(Line *line, int col) {
+  return line->advance_cache[col];
 }
 
 // Convert pixel position → logical column. Used during: UP arrow and DOWN arrow
-int get_closest_column(FT_Face face, Line *line, int target_x) {
+int get_closest_column(Line *line, int target_x) {
   int best_col = 0;
   int best_distance = 999999;
   for (int col = 0; col <= line->length; col++) {
-    int current_x = get_line_x_position(face, line, col);
+    int current_x = get_line_x_position(line, col);
     int distance = abs(current_x - target_x);
     if (distance < best_distance) {
       best_distance = distance;
@@ -109,9 +97,9 @@ int get_closest_column(FT_Face face, Line *line, int target_x) {
 }
 
 // remember desired horizontal cursor position
-void refresh_preferred_x(Editor *editor, FT_Face face) {
-  editor->preferred_x = get_line_x_position(
-      face, &editor->lines[editor->cursor_row], editor->cursor_col);
+void refresh_preferred_x(Editor *editor) {
+  editor->preferred_x = get_line_x_position(&editor->lines[editor->cursor_row],
+                                            editor->cursor_col);
 }
 
 int utf8_prev_char(char *data, int index) {
@@ -139,6 +127,28 @@ int utf8_next_char(char *data, int length, int index) {
 bool is_word_char(char c) {
   return ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
           (c >= '0' && c <= '9') || c == '_');
+}
+
+void rebuild_line_cache(FT_Face face, Line *line) {
+  int x = 80;
+  line->advance_cache[0] = x;
+  int visual_col = 1;
+  for (int i = 0; i < line->length;) {
+    unsigned char c = line->data[i];
+    i = utf8_next_char(line->data, line->length, i);
+    if (c == ' ') {
+      x += 16;
+    } else if (c == '\t') {
+      x += 64;
+    } else {
+      if (!FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+        x += face->glyph->advance.x >> 6;
+      }
+    }
+    // Future Implementations: Use tab stops, or align tabs to columns, or
+    // compute nearest tab boundary
+    line->advance_cache[visual_col++] = x;
+  }
 }
 
 int main() {
@@ -215,6 +225,7 @@ int main() {
   editor.line_count = 1;
   editor.lines = malloc(sizeof(Line) * editor.line_capacity);
   line_init(&editor.lines[0]);
+  rebuild_line_cache(face, &editor.lines[0]);
   editor.cursor_row = 0;
   editor.cursor_col = 0;
   editor.preferred_x = 20;
@@ -247,8 +258,9 @@ int main() {
                            // character only. This is a limitation. UTF-8
                            // characters may occupy multiple bytes.
         editor.cursor_col++;
+        rebuild_line_cache(face, line);
         editor.preferred_x = get_line_x_position(
-            face, &editor.lines[editor.cursor_row], editor.cursor_col);
+            &editor.lines[editor.cursor_row], editor.cursor_col);
         break;
       }
 
@@ -270,8 +282,9 @@ int main() {
                     line->length - editor.cursor_col + 1);
             editor.cursor_col--;
             editor.preferred_x = get_line_x_position(
-                face, &editor.lines[editor.cursor_row], editor.cursor_col);
+                &editor.lines[editor.cursor_row], editor.cursor_col);
             line->length--;
+            rebuild_line_cache(face, line);
           } else if (editor.cursor_row > 0) {
             int previous_row = editor.cursor_row - 1;
             Line *previous = &editor.lines[previous_row];
@@ -282,12 +295,12 @@ int main() {
                 fprintf(stderr, "Failed to expand line buffer\n");
                 return 1;
               }
-              line_expand(previous);
             }
 
             memcpy(&previous->data[previous->length], line->data,
                    line->length + 1);
             previous->length += line->length;
+            rebuild_line_cache(face, previous);
             free(line->data);
 
             for (int i = editor.cursor_row; i < editor.line_count - 1; i++) {
@@ -304,8 +317,9 @@ int main() {
             line_insert_char(line, editor.cursor_col, ' ');
             editor.cursor_col++;
           }
+          rebuild_line_cache(face, line);
           editor.preferred_x = get_line_x_position(
-              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+              &editor.lines[editor.cursor_row], editor.cursor_col);
         }
 
         if (event.key.keysym.sym == SDLK_RETURN) {
@@ -326,16 +340,17 @@ int main() {
               fprintf(stderr, "Failed to expand line buffer\n");
               return 1;
             }
-            line_expand(&new_line);
           }
 
           memcpy(new_line.data, &line->data[editor.cursor_col], split_length);
           new_line.length = split_length;
           new_line.data[split_length] = '\0';
+          rebuild_line_cache(face, &new_line);
           int old_length = line->length;
           line->length = editor.cursor_col;
           line->data[line->length] = '\0';
           memset(&line->data[line->length + 1], 0, old_length - line->length);
+          rebuild_line_cache(face, line);
           editor.lines[editor.cursor_row + 1] = new_line;
           editor.line_count++;
           editor.cursor_row++;
@@ -385,7 +400,7 @@ int main() {
           }
 
           editor.preferred_x = get_line_x_position(
-              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+              &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -416,7 +431,7 @@ int main() {
           }
 
           editor.preferred_x = get_line_x_position(
-              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+              &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -424,14 +439,13 @@ int main() {
         if (event.key.keysym.sym == SDLK_UP) {
           Uint32 now = SDL_GetTicks(); // current runtime time in milliseconds
           if (now - editor.last_vertical_move > 2000) {
-            refresh_preferred_x(&editor, face);
+            refresh_preferred_x(&editor);
           }
           editor.last_vertical_move = now;
           if (editor.cursor_row > 0) {
             editor.cursor_row--;
             Line *up_line = &editor.lines[editor.cursor_row];
-            editor.cursor_col =
-                get_closest_column(face, up_line, editor.preferred_x);
+            editor.cursor_col = get_closest_column(up_line, editor.preferred_x);
             cursor_moving = true;
             cursor_visible = true;
           }
@@ -440,14 +454,14 @@ int main() {
         if (event.key.keysym.sym == SDLK_DOWN) {
           Uint32 now = SDL_GetTicks();
           if (now - editor.last_vertical_move > 2000) {
-            refresh_preferred_x(&editor, face);
+            refresh_preferred_x(&editor);
           }
           editor.last_vertical_move = now;
           if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             Line *down_line = &editor.lines[editor.cursor_row];
             editor.cursor_col =
-                get_closest_column(face, down_line, editor.preferred_x);
+                get_closest_column(down_line, editor.preferred_x);
             cursor_moving = true;
             cursor_visible = true;
           }
@@ -586,18 +600,7 @@ int main() {
     int cursor_y = 40 + (editor.cursor_row * 40);
     Line *cursor_line = &editor.lines[editor.cursor_row];
 
-    for (int i = 0; i < editor.cursor_col; i++) {
-      char c = cursor_line->data[i];
-      if (c == ' ') {
-        cursor_x += 16;
-        continue;
-      }
-
-      if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
-        continue;
-      }
-      cursor_x += face->glyph->advance.x >> 6;
-    }
+    cursor_x = get_line_x_position(cursor_line, editor.cursor_col);
 
     SDL_Rect cursor = {cursor_x, cursor_y - 20, 2, 28};
     if (cursor_visible) {
@@ -611,6 +614,7 @@ int main() {
 
   for (int i = 0; i < editor.line_count; i++) {
     free(editor.lines[i].data);
+    free(editor.lines[i].advance_cache);
   }
 
   free(editor.lines);
