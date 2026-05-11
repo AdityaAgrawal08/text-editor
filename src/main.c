@@ -1,3 +1,4 @@
+#include "SDL_keyboard.h"
 #include "SDL_keycode.h" //keyboard key constants used for event handling
 #include <SDL2/SDL.h> //Simple DirectMedia Layer. SDL becomes the platform abstraction layer.
 #include <ft2build.h> //FreeType
@@ -111,6 +112,33 @@ int get_closest_column(FT_Face face, Line *line, int target_x) {
 void refresh_preferred_x(Editor *editor, FT_Face face) {
   editor->preferred_x = get_line_x_position(
       face, &editor->lines[editor->cursor_row], editor->cursor_col);
+}
+
+int utf8_prev_char(char *data, int index) {
+  if (index <= 0) {
+    return 0;
+  }
+  index--;
+  while (index > 0 && ((data[index] & 0xC0) == 0x80)) {
+    index--;
+  }
+  return index;
+}
+
+int utf8_next_char(char *data, int length, int index) {
+  if (index >= length) {
+    return length;
+  }
+  index++;
+  while (index < length && ((data[index] & 0xC0) == 0x80)) {
+    index++;
+  }
+  return index;
+}
+
+bool is_word_char(char c) {
+  return ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_');
 }
 
 int main() {
@@ -307,7 +335,7 @@ int main() {
           int old_length = line->length;
           line->length = editor.cursor_col;
           line->data[line->length] = '\0';
-          memeset(&line->data[line->length + 1], 0, old_length - line->length);
+          memset(&line->data[line->length + 1], 0, old_length - line->length);
           editor.lines[editor.cursor_row + 1] = new_line;
           editor.line_count++;
           editor.cursor_row++;
@@ -315,13 +343,47 @@ int main() {
           editor.preferred_x = 20;
         }
 
+        // LEFT AND RIGHT LOGIC:
+        //  If cursor inside line:
+        //  If CTRL held:
+        //    move to previous word
+        //  Else:
+        //    move to previous UTF-8 character
+        //  Else:
+        //    move to previous line end
+        //  Then:
+        //    update visual cursor state
+        //
         if (event.key.keysym.sym == SDLK_LEFT) {
+          SDL_Keymod mod = SDL_GetModState(); // ctrl, shift and alt.
           if (editor.cursor_col > 0) {
-            editor.cursor_col--;
-          } else if (editor.cursor_row > 0) {
+            if (mod &
+                KMOD_CTRL) { // KMOD_CTRL is a bit flag. Multiple modifiers may
+                             // exist simultaneously. For example: Ctrl + Shift.
+                             // So "==" will fail. So we do Bitwise and Check
+                             // whether ctrl bit exists or not.
+              while (editor.cursor_col > 0 &&
+                     !is_word_char(line->data[utf8_prev_char(
+                         line->data, editor.cursor_col)])) {
+                editor.cursor_col =
+                    utf8_prev_char(line->data, editor.cursor_col);
+              }
+              while (editor.cursor_col > 0 &&
+                     is_word_char(line->data[utf8_prev_char(
+                         line->data, editor.cursor_col)])) {
+                editor.cursor_col =
+                    utf8_prev_char(line->data, editor.cursor_col);
+              }
+            } else {
+              editor.cursor_col = utf8_prev_char(line->data, editor.cursor_col);
+            }
+          }
+
+          else if (editor.cursor_row > 0) {
             editor.cursor_row--;
             editor.cursor_col = editor.lines[editor.cursor_row].length;
           }
+
           editor.preferred_x = get_line_x_position(
               face, &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
@@ -329,12 +391,30 @@ int main() {
         }
 
         if (event.key.keysym.sym == SDLK_RIGHT) {
+          SDL_Keymod mod = SDL_GetModState();
           if (editor.cursor_col < line->length) {
-            editor.cursor_col++;
-          } else if (editor.cursor_row < editor.line_count - 1) {
+            if (mod & KMOD_CTRL) {
+              while (editor.cursor_col < line->length &&
+                     is_word_char(line->data[editor.cursor_col])) {
+                editor.cursor_col =
+                    utf8_next_char(line->data, line->length, editor.cursor_col);
+              }
+              while (editor.cursor_col < line->length &&
+                     !is_word_char(line->data[editor.cursor_col])) {
+                editor.cursor_col =
+                    utf8_next_char(line->data, line->length, editor.cursor_col);
+              }
+            } else {
+              editor.cursor_col =
+                  utf8_next_char(line->data, line->length, editor.cursor_col);
+            }
+          }
+
+          else if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             editor.cursor_col = 0;
           }
+
           editor.preferred_x = get_line_x_position(
               face, &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
@@ -342,7 +422,7 @@ int main() {
         }
 
         if (event.key.keysym.sym == SDLK_UP) {
-          Uint32 now = SDL_GetTicks();
+          Uint32 now = SDL_GetTicks(); // current runtime time in milliseconds
           if (now - editor.last_vertical_move > 2000) {
             refresh_preferred_x(&editor, face);
           }
