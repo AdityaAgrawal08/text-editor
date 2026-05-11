@@ -21,19 +21,20 @@ Character added to text buffer
 Screen cleared
     ↓
 Each character processed:
-        Character
-            ↓
-        Glyph loaded
-            ↓
-        Glyph rasterized
-            ↓
-        Bitmap created
-            ↓
-        Surface created
-            ↓
-        Texture created
-            ↓
-        Texture rendered
+
+Character
+    ↓
+Glyph loaded
+    ↓
+Glyph rasterized
+    ↓
+Bitmap created
+    ↓
+Surface created
+    ↓
+Texture created
+    ↓
+Texture rendered
     ↓
 Cursor rendered
     ↓
@@ -48,3 +49,43 @@ About Space and Tab:
 -> no visible bitmap
 -> but still advances cursor
 => So rendering skipped, but cursor moves.
+
+
+Important SDL systems used here:
+-> SDL uses a Backbuffer system, Instead of drawing directly to the screen (which causes flickering), we draw the entire scene onto the hidden buffer. Once the scene is finished, we swap that buffer onto the visible window.
+  Window System:
+    SDL_WINDOW
+    SDL_CreateWindow()
+  Renderer System:
+    SDL_Renderer: Structure that handles all the drawing state for a specific window.
+    SDL_RenderCopy: Function copies a portion of a texture to the current rendering target. This does not show anything on the screen yet; it only updates the backbuffer.
+    SDL_RenderPresent: Function that updates the window with the contents of the backbuffer.
+  Event System:
+    SDL_Event
+    SDL_PollEvent()
+  Suface System:
+    SDL_Surface: SDL_Surface represents a block of image data in system memory (RAM). Surfaces are not automatically cleaned up.We must call SDL_FreeSurface(surface_name) when we are done to avoid memory leaks.
+  Texture System:
+    SDL_Texture: SDL_Texture is the hardware-accelerated counterpart to a surface. It represents image data stored in VRAM (Video RAM) on your graphics card. If an SDL_Surface is a physical photograph on your desk, an SDL_Texture is a slide loaded into a high-speed digital projector.
+  Timing:
+    SDL_GetTicks(): Used for cursor blinking and movement timing.
+
+-> FreeTypes:
+FreeTypes is a font rasterization engine. It converts font vector data to Pixel Bitmaps.
+Important: SDL_ttf exists, but we bypasses it and uses FreeType directly.
+->Code uses FreeType for:
+    glyph loading
+    glyph metrics
+    advance widths
+    bitmap generation
+
+
+Current Model:
+  Editor
+ ├── Line 0
+ ├── Line 1
+ ├── Line 2
+ └── ...
+  For each line:
+  Line
+ └── char*

@@ -1,6 +1,7 @@
+#include "SDL_keyboard.h"
 #include "SDL_keycode.h" //keyboard key constants used for event handling
-#include <SDL2/SDL.h>    //Simple DirectMedia Layer
-#include <ft2build.h>    //FreeType
+#include <SDL2/SDL.h> //Simple DirectMedia Layer. SDL becomes the platform abstraction layer.
+#include <ft2build.h> //FreeType
 #include <stdbool.h>
 #include FT_FREETYPE_H
 #include <stdio.h>
@@ -10,6 +11,7 @@
 // Line Structure
 typedef struct {
   char *data;
+  int *advance_cache;
   int length;
   int capacity;
 } Line;
@@ -21,56 +23,70 @@ typedef struct {
   int line_capacity;
   int cursor_row;
   int cursor_col;
-  int preferred_x;
-  Uint32 last_vertical_move;
+  int preferred_x; // desired horizontal visual position
+
+  Uint32 last_vertical_move; // Tracks timing of vertical navigation. After
+                             // enough delay, vertical movement should establish
+                             // a new preferred_x.
 } Editor;
 
 void line_init(Line *line) {
   line->capacity = 32;
   line->length = 0;
   line->data = malloc(line->capacity);
+  line->advance_cache = malloc(sizeof(int) * line->capacity);
   line->data[0] = '\0';
+  line->advance_cache[0] = 80;
 }
 
-void line_expand(Line *line) {
-  line->capacity *= 2;
-  line->data = realloc(line->data, line->capacity);
+bool line_expand(Line *line) {
+  int new_capacity = line->capacity *= 2;
+  char *new_data = realloc(line->data, line->capacity);
+  if (!new_data) {
+    fprintf(stderr, "Failed to expand line buffer\n");
+    return false;
+  }
+
+  int *new_cache = realloc(line->advance_cache, sizeof(int) * new_capacity);
+  if (!new_cache) {
+    return false;
+  }
+  line->data = new_data;
+  line->advance_cache = new_cache;
+  line->capacity = new_capacity;
+  return true;
 }
 
+// actual insertion engine. Improvement in future: gap buffers, ropes, piece
+// tables.
 void line_insert_char(Line *line, int index, char c) {
   if (line->length + 1 >= line->capacity) {
-    line_expand(line);
+    if (!line_expand(line)) {
+      fprintf(stderr, "Failed to expand line buffer\n");
+      return;
+    }
   }
   memmove(&line->data[index + 1], &line->data[index], line->length - index + 1);
   line->data[index] = c;
   line->length++;
 }
 
-int get_line_x_position(FT_Face face, Line *line, int col) {
-  int x = 80;
-  for (int i = 0; i < col; i++) {
-    char c = line->data[i];
-    if (c == ' ') {
-      x += 16;
-      continue;
-    }
-    if (c == '\t') {
-      x += 64;
-      continue;
-    }
-    if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
-      continue;
-    }
-    x += face->glyph->advance.x >> 6;
-  }
-  return x;
+// Important Limitation: Current editor assumes: 1 char = 1 byte, which will
+// fail for UTF-8, emoji's, multibyte glyph.
+
+// The editor internally stores cursor as: cursor_row, cursor_col, But rendering
+// works in: pixel coordinates. So the editor constantly converts: text position
+// to screen position This phase handles that conversion.
+int get_line_x_position(Line *line, int col) {
+  return line->advance_cache[col];
 }
 
-int get_closest_column(FT_Face face, Line *line, int target_x) {
+// Convert pixel position → logical column. Used during: UP arrow and DOWN arrow
+int get_closest_column(Line *line, int target_x) {
   int best_col = 0;
   int best_distance = 999999;
   for (int col = 0; col <= line->length; col++) {
-    int current_x = get_line_x_position(face, line, col);
+    int current_x = get_line_x_position(line, col);
     int distance = abs(current_x - target_x);
     if (distance < best_distance) {
       best_distance = distance;
@@ -80,9 +96,59 @@ int get_closest_column(FT_Face face, Line *line, int target_x) {
   return best_col;
 }
 
-void refresh_preferred_x(Editor *editor, FT_Face face) {
-  editor->preferred_x = get_line_x_position(
-      face, &editor->lines[editor->cursor_row], editor->cursor_col);
+// remember desired horizontal cursor position
+void refresh_preferred_x(Editor *editor) {
+  editor->preferred_x = get_line_x_position(&editor->lines[editor->cursor_row],
+                                            editor->cursor_col);
+}
+
+int utf8_prev_char(char *data, int index) {
+  if (index <= 0) {
+    return 0;
+  }
+  index--;
+  while (index > 0 && ((data[index] & 0xC0) == 0x80)) {
+    index--;
+  }
+  return index;
+}
+
+int utf8_next_char(char *data, int length, int index) {
+  if (index >= length) {
+    return length;
+  }
+  index++;
+  while (index < length && ((data[index] & 0xC0) == 0x80)) {
+    index++;
+  }
+  return index;
+}
+
+bool is_word_char(char c) {
+  return ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_');
+}
+
+void rebuild_line_cache(FT_Face face, Line *line) {
+  int x = 80;
+  line->advance_cache[0] = x;
+  int visual_col = 1;
+  for (int i = 0; i < line->length;) {
+    unsigned char c = line->data[i];
+    i = utf8_next_char(line->data, line->length, i);
+    if (c == ' ') {
+      x += 16;
+    } else if (c == '\t') {
+      x += 64;
+    } else {
+      if (!FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+        x += face->glyph->advance.x >> 6;
+      }
+    }
+    // Future Implementations: Use tab stops, or align tabs to columns, or
+    // compute nearest tab boundary
+    line->advance_cache[visual_col++] = x;
+  }
 }
 
 int main() {
@@ -92,6 +158,7 @@ int main() {
     return 1;
   }
 
+  // Create an actual application window for this editor
   SDL_Window *window = SDL_CreateWindow(
       "Text Editor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600,
       SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -102,8 +169,17 @@ int main() {
     return 1;
   }
 
+  // A window is only: display surface owned by OS. A renderer is: drawing
+  // engine attached to that surface. Separation is important because: multiple
+  // rendering backend is required or redering lifecycle differs from window
+  // lifecycle.
   SDL_Renderer *renderer = SDL_CreateRenderer(
-      window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+      window, -1,
+      SDL_RENDERER_ACCELERATED |      // the renderer will use the graphics
+                                      // hardware if available.
+          SDL_RENDERER_PRESENTVSYNC); // Synchronizes frame presentation with
+                                      // monitor refresh rate.
+
   if (!renderer) {
     SDL_Log("Renderer Creation Failed: %s", SDL_GetError());
     SDL_DestroyWindow(window);
@@ -111,14 +187,19 @@ int main() {
     return 1;
   }
 
-  FT_Library ft;
+  FT_Library ft; // initializing FreeType.
   if (FT_Init_FreeType(&ft)) {
     SDL_Log("Failed to initialize FreeType");
     return 1;
   }
 
   FT_Face face;
-  const char *font_paths[] = {"assets/font.ttf", "../assets/font.ttf"};
+  const char *font_paths[] = {
+      "assets/font.ttf",
+      "../assets/font.ttf"}; // The .ttf file provides the mathematical
+                             // blueprints to draw it. FreeType reads to turn
+                             // the typed character into a picture on the
+                             // screen:
   int font_loaded = 0;
   for (int i = 0; i < (int)(sizeof(font_paths) / sizeof(font_paths[0])); i++) {
     if (FT_New_Face(ft, font_paths[i], 0, &face) == 0) {
@@ -144,11 +225,11 @@ int main() {
   editor.line_count = 1;
   editor.lines = malloc(sizeof(Line) * editor.line_capacity);
   line_init(&editor.lines[0]);
+  rebuild_line_cache(face, &editor.lines[0]);
   editor.cursor_row = 0;
   editor.cursor_col = 0;
   editor.preferred_x = 20;
   bool running = true;
-
   Uint32 last_blink = SDL_GetTicks();
   bool cursor_visible = true;
   bool cursor_moving = false;
@@ -162,37 +243,64 @@ int main() {
         break;
 
       case SDL_TEXTINPUT: {
-        Line *line = &editor.lines[editor.cursor_row];
-        line_insert_char(line, editor.cursor_col, event.text.text[0]);
+        Line *line =
+            &editor.lines[editor.cursor_row]; // The editor first
+                                              // determines,which line is cursor
+                                              // currently on. If the cursor is
+                                              // at line 2, then editor.lines[2]
+                                              // becomes the active line.
+                                              //
+        line_insert_char(
+            line, editor.cursor_col,
+            event.text
+                .text[0]); // SDL stores the typed text in event.text.text. The
+                           // current code uses 0 -> meaning single-byte
+                           // character only. This is a limitation. UTF-8
+                           // characters may occupy multiple bytes.
         editor.cursor_col++;
+        rebuild_line_cache(face, line);
         editor.preferred_x = get_line_x_position(
-            face, &editor.lines[editor.cursor_row], editor.cursor_col);
+            &editor.lines[editor.cursor_row], editor.cursor_col);
         break;
       }
 
       case SDL_KEYDOWN: {
-        Line *line = &editor.lines[editor.cursor_row];
-        if (event.key.keysym.sym == SDLK_BACKSPACE) {
+        Line *line =
+            &editor.lines[editor.cursor_row]; // Same -> The editor first
+                                              // determines which line is the
+                                              // currently active.
+        if (event.key.keysym.sym ==
+            SDLK_BACKSPACE) { // Case1: Delete character inside current Line.
+                              // Case2: Merge current Line with previous line.
+          // Logic:
+          // Case1: If the cursor is NOT at the beginning of line -> delete
+          // charater.
+          // Case2: Merge Line.
           if (editor.cursor_col > 0) {
             memmove(&line->data[editor.cursor_col - 1],
                     &line->data[editor.cursor_col],
                     line->length - editor.cursor_col + 1);
             editor.cursor_col--;
             editor.preferred_x = get_line_x_position(
-                face, &editor.lines[editor.cursor_row], editor.cursor_col);
+                &editor.lines[editor.cursor_row], editor.cursor_col);
             line->length--;
+            rebuild_line_cache(face, line);
           } else if (editor.cursor_row > 0) {
             int previous_row = editor.cursor_row - 1;
             Line *previous = &editor.lines[previous_row];
             int old_length = previous->length;
 
             while (previous->length + line->length + 1 >= previous->capacity) {
-              line_expand(previous);
+              if (!line_expand(previous)) {
+                fprintf(stderr, "Failed to expand line buffer\n");
+                return 1;
+              }
             }
 
             memcpy(&previous->data[previous->length], line->data,
                    line->length + 1);
             previous->length += line->length;
+            rebuild_line_cache(face, previous);
             free(line->data);
 
             for (int i = editor.cursor_row; i < editor.line_count - 1; i++) {
@@ -209,6 +317,9 @@ int main() {
             line_insert_char(line, editor.cursor_col, ' ');
             editor.cursor_col++;
           }
+          rebuild_line_cache(face, line);
+          editor.preferred_x = get_line_x_position(
+              &editor.lines[editor.cursor_row], editor.cursor_col);
         }
 
         if (event.key.keysym.sym == SDLK_RETURN) {
@@ -225,14 +336,21 @@ int main() {
           int split_length = line->length - editor.cursor_col;
 
           while (new_line.capacity <= split_length) {
-            line_expand(&new_line);
+            if (!line_expand(&new_line)) {
+              fprintf(stderr, "Failed to expand line buffer\n");
+              return 1;
+            }
           }
 
           memcpy(new_line.data, &line->data[editor.cursor_col], split_length);
           new_line.length = split_length;
           new_line.data[split_length] = '\0';
+          rebuild_line_cache(face, &new_line);
+          int old_length = line->length;
           line->length = editor.cursor_col;
           line->data[line->length] = '\0';
+          memset(&line->data[line->length + 1], 0, old_length - line->length);
+          rebuild_line_cache(face, line);
           editor.lines[editor.cursor_row + 1] = new_line;
           editor.line_count++;
           editor.cursor_row++;
@@ -240,43 +358,94 @@ int main() {
           editor.preferred_x = 20;
         }
 
+        // LEFT AND RIGHT LOGIC:
+        //  If cursor inside line:
+        //  If CTRL held:
+        //    move to previous word
+        //  Else:
+        //    move to previous UTF-8 character
+        //  Else:
+        //    move to previous line end
+        //  Then:
+        //    update visual cursor state
+        //
         if (event.key.keysym.sym == SDLK_LEFT) {
+          SDL_Keymod mod = SDL_GetModState(); // ctrl, shift and alt.
           if (editor.cursor_col > 0) {
-            editor.cursor_col--;
-          } else if (editor.cursor_row > 0) {
+            if (mod &
+                KMOD_CTRL) { // KMOD_CTRL is a bit flag. Multiple modifiers may
+                             // exist simultaneously. For example: Ctrl + Shift.
+                             // So "==" will fail. So we do Bitwise and Check
+                             // whether ctrl bit exists or not.
+              while (editor.cursor_col > 0 &&
+                     !is_word_char(line->data[utf8_prev_char(
+                         line->data, editor.cursor_col)])) {
+                editor.cursor_col =
+                    utf8_prev_char(line->data, editor.cursor_col);
+              }
+              while (editor.cursor_col > 0 &&
+                     is_word_char(line->data[utf8_prev_char(
+                         line->data, editor.cursor_col)])) {
+                editor.cursor_col =
+                    utf8_prev_char(line->data, editor.cursor_col);
+              }
+            } else {
+              editor.cursor_col = utf8_prev_char(line->data, editor.cursor_col);
+            }
+          }
+
+          else if (editor.cursor_row > 0) {
             editor.cursor_row--;
             editor.cursor_col = editor.lines[editor.cursor_row].length;
           }
+
           editor.preferred_x = get_line_x_position(
-              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+              &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
 
         if (event.key.keysym.sym == SDLK_RIGHT) {
+          SDL_Keymod mod = SDL_GetModState();
           if (editor.cursor_col < line->length) {
-            editor.cursor_col++;
-          } else if (editor.cursor_row < editor.line_count - 1) {
+            if (mod & KMOD_CTRL) {
+              while (editor.cursor_col < line->length &&
+                     is_word_char(line->data[editor.cursor_col])) {
+                editor.cursor_col =
+                    utf8_next_char(line->data, line->length, editor.cursor_col);
+              }
+              while (editor.cursor_col < line->length &&
+                     !is_word_char(line->data[editor.cursor_col])) {
+                editor.cursor_col =
+                    utf8_next_char(line->data, line->length, editor.cursor_col);
+              }
+            } else {
+              editor.cursor_col =
+                  utf8_next_char(line->data, line->length, editor.cursor_col);
+            }
+          }
+
+          else if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             editor.cursor_col = 0;
           }
+
           editor.preferred_x = get_line_x_position(
-              face, &editor.lines[editor.cursor_row], editor.cursor_col);
+              &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
 
         if (event.key.keysym.sym == SDLK_UP) {
-          Uint32 now = SDL_GetTicks();
+          Uint32 now = SDL_GetTicks(); // current runtime time in milliseconds
           if (now - editor.last_vertical_move > 2000) {
-            refresh_preferred_x(&editor, face);
+            refresh_preferred_x(&editor);
           }
           editor.last_vertical_move = now;
           if (editor.cursor_row > 0) {
             editor.cursor_row--;
             Line *up_line = &editor.lines[editor.cursor_row];
-            editor.cursor_col =
-                get_closest_column(face, up_line, editor.preferred_x);
+            editor.cursor_col = get_closest_column(up_line, editor.preferred_x);
             cursor_moving = true;
             cursor_visible = true;
           }
@@ -285,14 +454,14 @@ int main() {
         if (event.key.keysym.sym == SDLK_DOWN) {
           Uint32 now = SDL_GetTicks();
           if (now - editor.last_vertical_move > 2000) {
-            refresh_preferred_x(&editor, face);
+            refresh_preferred_x(&editor);
           }
           editor.last_vertical_move = now;
           if (editor.cursor_row < editor.line_count - 1) {
             editor.cursor_row++;
             Line *down_line = &editor.lines[editor.cursor_row];
             editor.cursor_col =
-                get_closest_column(face, down_line, editor.preferred_x);
+                get_closest_column(down_line, editor.preferred_x);
             cursor_moving = true;
             cursor_visible = true;
           }
@@ -431,18 +600,7 @@ int main() {
     int cursor_y = 40 + (editor.cursor_row * 40);
     Line *cursor_line = &editor.lines[editor.cursor_row];
 
-    for (int i = 0; i < editor.cursor_col; i++) {
-      char c = cursor_line->data[i];
-      if (c == ' ') {
-        cursor_x += 16;
-        continue;
-      }
-
-      if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
-        continue;
-      }
-      cursor_x += face->glyph->advance.x >> 6;
-    }
+    cursor_x = get_line_x_position(cursor_line, editor.cursor_col);
 
     SDL_Rect cursor = {cursor_x, cursor_y - 20, 2, 28};
     if (cursor_visible) {
@@ -456,6 +614,7 @@ int main() {
 
   for (int i = 0; i < editor.line_count; i++) {
     free(editor.lines[i].data);
+    free(editor.lines[i].advance_cache);
   }
 
   free(editor.lines);
