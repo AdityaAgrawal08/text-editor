@@ -13,12 +13,23 @@
 #define LINES_INITIAL_CAPACITY 16
 #define FONT_SIZE_PX 24
 #define LINE_HEIGHT_PX 40
-#define TEXT_X_ORIGIN 80
-#define GUTTER_X 20
+#define GUTTER_X 15
 #define FIRST_LINE_Y 40
 #define CURSOR_BLINK_MS 500
 #define VERTICAL_MOVE_RESET_MS 2000
 #define CLIPBOARD_MAX (1 << 20)
+#define DEFAULT_FILENAME "untitled.txt"
+#define STATUS_BAR_HEIGHT 28
+#define UNDO_STACK_SIZE 100
+
+typedef enum {
+  MODE_VIEW,
+  MODE_EDIT,
+  MODE_SAVE_PROMPT,
+  MODE_OPEN_PROMPT,
+  MODE_FIND,
+  MODE_REPLACE,
+} EditorMode;
 
 typedef struct {
   char *data;
@@ -27,6 +38,13 @@ typedef struct {
   int gap_end;
   int capacity;
 } Line;
+
+typedef struct {
+  Line *lines;
+  int line_count;
+  int cursor_row;
+  int cursor_col;
+} EditorSnapshot;
 
 typedef struct {
   Line *lines;
@@ -42,6 +60,17 @@ typedef struct {
   char *clipboard;
   int clipboard_len;
   int scroll_row;
+  char filename[512];
+  bool dirty;
+  char status_msg[256];
+  Uint32 status_msg_time;
+  EditorMode mode;
+  char prompt_buf[512];
+  char replace_buf[512];
+  int prompt_cursor;
+  EditorSnapshot *undo_stack[UNDO_STACK_SIZE];
+  int undo_ptr;
+  int text_x;
 } Editor;
 
 static int line_length(const Line *l) {
@@ -86,6 +115,22 @@ static void line_free(Line *l) {
   l->data = NULL;
   l->advance_cache = NULL;
   l->gap_start = l->gap_end = l->capacity = 0;
+}
+
+static bool line_clone(Line *dest, const Line *src) {
+  dest->capacity = src->capacity;
+  dest->gap_start = src->gap_start;
+  dest->gap_end = src->gap_end;
+  dest->data = malloc((size_t)src->capacity);
+  if (!dest->data) return false;
+  memcpy(dest->data, src->data, (size_t)src->capacity);
+  dest->advance_cache = malloc((size_t)(src->capacity + 1) * sizeof(int));
+  if (!dest->advance_cache) {
+    free(dest->data);
+    return false;
+  }
+  memcpy(dest->advance_cache, src->advance_cache, (size_t)(src->capacity + 1) * sizeof(int));
+  return true;
 }
 
 static bool line_ensure_gap(Line *l, int needed) {
@@ -251,7 +296,7 @@ static bool is_word_char(uint32_t cp) {
   return false;
 }
 
-static void rebuild_line_cache(FT_Face face, Line *l) {
+static void rebuild_line_cache(Editor *e, FT_Face face, Line *l) {
   int len = line_length(l);
   if (!l->advance_cache) {
     l->advance_cache = calloc((size_t)(l->capacity + 1), sizeof(int));
@@ -259,7 +304,7 @@ static void rebuild_line_cache(FT_Face face, Line *l) {
       return;
   }
 
-  int x = TEXT_X_ORIGIN;
+  int x = e->text_x;
   l->advance_cache[0] = x;
 
   for (int col = 0; col < len;) {
@@ -292,24 +337,24 @@ static void rebuild_line_cache(FT_Face face, Line *l) {
     l->advance_cache[len] = x;
 }
 
-static int get_line_x_position(const Line *l, int col) {
+static int get_line_x_position(const Editor *e, const Line *l, int col) {
   if (col <= 0)
-    return TEXT_X_ORIGIN;
+    return e->text_x;
   int len = line_length(l);
   if (col > len)
     col = len;
   if (!l->advance_cache)
-    return TEXT_X_ORIGIN;
+    return e->text_x;
   return l->advance_cache[col];
 }
 
-static int get_closest_column(const Line *l, int target_x) {
+static int get_closest_column(const Editor *e, const Line *l, int target_x) {
   int len = line_length(l);
   if (len == 0)
     return 0;
 
   int best_col = 0;
-  int best_dist = abs(get_line_x_position(l, 0) - target_x);
+  int best_dist = abs(get_line_x_position(e, l, 0) - target_x);
 
   for (int col = 0; col < len;) {
     uint32_t cp = 0;
@@ -317,7 +362,7 @@ static int get_closest_column(const Line *l, int target_x) {
     if (!line_decode_codepoint(l, col, &cp, &bytes) || bytes <= 0)
       bytes = 1;
     int next_col = col + bytes;
-    int dist = abs(get_line_x_position(l, next_col) - target_x);
+    int dist = abs(get_line_x_position(e, l, next_col) - target_x);
     if (dist < best_dist) {
       best_dist = dist;
       best_col = next_col;
@@ -328,11 +373,129 @@ static int get_closest_column(const Line *l, int target_x) {
 }
 
 static void refresh_preferred_x(Editor *e) {
-  e->preferred_x = get_line_x_position(&e->lines[e->cursor_row], e->cursor_col);
+  e->preferred_x = get_line_x_position(e, &e->lines[e->cursor_row], e->cursor_col);
+}
+
+typedef enum {
+  TOKEN_TEXT,
+  TOKEN_KEYWORD,
+  TOKEN_TYPE,
+  TOKEN_STRING,
+  TOKEN_COMMENT,
+  TOKEN_NUMBER,
+  TOKEN_PREPROCESSOR,
+} TokenType;
+
+static bool is_keyword(const char *s, int len) {
+  static const char *keywords[] = {
+    "break", "case", "continue", "default", "do", "else", "enum", "extern",
+    "for", "goto", "if", "register", "return", "sizeof", "static", "struct",
+    "switch", "typedef", "union", "volatile", "while", "auto", "const"
+  };
+  for (int i = 0; i < (int)(sizeof(keywords) / sizeof(keywords[0])); i++) {
+    if (len == (int)strlen(keywords[i]) && strncmp(s, keywords[i], (size_t)len) == 0)
+      return true;
+  }
+  return false;
+}
+
+static bool is_type(const char *s, int len) {
+  static const char *types[] = {
+    "int", "char", "float", "double", "void", "size_t", "ssize_t", "bool",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t",
+    "Uint8", "Uint16", "Uint32", "Uint64", "Sint8", "Sint16", "Sint32", "Sint64"
+  };
+  for (int i = 0; i < (int)(sizeof(types) / sizeof(types[0])); i++) {
+    if (len == (int)strlen(types[i]) && strncmp(s, types[i], (size_t)len) == 0)
+      return true;
+  }
+  return false;
+}
+
+static TokenType get_token_at(Line *l, int col, int *token_len) {
+  int len = line_length(l);
+  if (col >= len) return TOKEN_TEXT;
+
+  char c = line_char_at(l, col);
+
+  // Comments
+  if (c == '/' && col + 1 < len && line_char_at(l, col + 1) == '/') {
+    *token_len = len - col;
+    return TOKEN_COMMENT;
+  }
+
+  // Preprocessor
+  if (c == '#') {
+    *token_len = 1;
+    while (col + *token_len < len && is_word_char(line_char_at(l, col + *token_len)))
+      (*token_len)++;
+    return TOKEN_PREPROCESSOR;
+  }
+
+  // Strings
+  if (c == '"') {
+    *token_len = 1;
+    while (col + *token_len < len) {
+      char sc = line_char_at(l, col + *token_len);
+      (*token_len)++;
+      if (sc == '"' && line_char_at(l, col + *token_len - 2) != '\\')
+        break;
+    }
+    return TOKEN_STRING;
+  }
+
+  // Numbers
+  if (c >= '0' && c <= '9') {
+    *token_len = 0;
+    while (col + *token_len < len && (is_word_char(line_char_at(l, col + *token_len)) || line_char_at(l, col + *token_len) == '.'))
+      (*token_len)++;
+    return TOKEN_NUMBER;
+  }
+
+  // Keywords and Types
+  if (is_word_char(c) && (col == 0 || !is_word_char(line_char_at(l, col - 1)))) {
+    int wlen = 0;
+    while (col + wlen < len && is_word_char(line_char_at(l, col + wlen)))
+      wlen++;
+    
+    char word[64];
+    if (wlen < 64) {
+      for (int i = 0; i < wlen; i++) word[i] = line_char_at(l, col + i);
+      word[wlen] = '\0';
+      if (is_keyword(word, wlen)) {
+        *token_len = wlen;
+        return TOKEN_KEYWORD;
+      }
+      if (is_type(word, wlen)) {
+        *token_len = wlen;
+        return TOKEN_TYPE;
+      }
+    }
+  }
+
+  *token_len = 1;
+  return TOKEN_TEXT;
+}
+
+static void update_gutter_width(Editor *e, FT_Face face) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%d", e->line_count);
+  int width = 0;
+  for (int i = 0; buf[i]; i++) {
+    if (FT_Load_Char(face, buf[i], FT_LOAD_DEFAULT) == 0)
+      width += (int)(face->glyph->advance.x >> 6);
+    else
+      width += 12;
+  }
+  int space_adv = 16;
+  if (FT_Load_Char(face, ' ', FT_LOAD_DEFAULT) == 0)
+    space_adv = (int)(face->glyph->advance.x >> 6);
+  
+  e->text_x = GUTTER_X + width + (space_adv * 2);
 }
 
 static void render_glyph(SDL_Renderer *renderer, FT_Face face, uint32_t cp,
-                         int *x, int y, Uint8 r, Uint8 g, Uint8 b) {
+                         int *x, int y, Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
   if (cp == ' ' || cp == '\t') {
     *x += 16;
     return;
@@ -373,6 +536,7 @@ static void render_glyph(SDL_Renderer *renderer, FT_Face face, uint32_t cp,
   SDL_RenderCopy(renderer, tex, NULL, &dst);
   SDL_DestroyTexture(tex);
   *x += (int)(glyph->advance.x >> 6);
+  (void)a;
 }
 
 static void editor_clear_selection(Editor *e) { e->selection_active = false; }
@@ -436,7 +600,7 @@ static void editor_delete_selection(Editor *e, FT_Face face) {
   if (s.row == t.row) {
     Line *l = &e->lines[s.row];
     line_delete_bytes(l, s.col, t.col - s.col);
-    rebuild_line_cache(face, l);
+    rebuild_line_cache(e, face, l);
   } else {
     Line *first = &e->lines[s.row];
     Line *last = &e->lines[t.row];
@@ -453,7 +617,7 @@ static void editor_delete_selection(Editor *e, FT_Face face) {
         first->gap_start += tail_len;
       }
     }
-    rebuild_line_cache(face, first);
+    rebuild_line_cache(e, face, first);
 
     for (int r = s.row + 1; r <= t.row; r++)
       line_free(&e->lines[r]);
@@ -489,10 +653,557 @@ static bool editor_ensure_lines(Editor *e, int needed) {
 static int visible_rows(SDL_Window *window) {
   int wh;
   SDL_GetWindowSize(window, NULL, &wh);
-  return (wh - FIRST_LINE_Y) / LINE_HEIGHT_PX;
+  return (wh - FIRST_LINE_Y - STATUS_BAR_HEIGHT) / LINE_HEIGHT_PX;
 }
 
-int main(void) {
+static void editor_set_status(Editor *e, const char *msg) {
+  snprintf(e->status_msg, sizeof(e->status_msg), "%s", msg);
+  e->status_msg_time = SDL_GetTicks();
+}
+
+static bool editor_save(Editor *e) {
+  FILE *f = fopen(e->filename, "w");
+  if (!f) {
+    editor_set_status(e, "ERR: could not open file for writing");
+    return false;
+  }
+  for (int row = 0; row < e->line_count; row++) {
+    Line *l = &e->lines[row];
+    int len = line_length(l);
+    for (int col = 0; col < len; col++)
+      fputc(line_char_at(l, col), f);
+    if (row < e->line_count - 1)
+      fputc('\n', f);
+  }
+  fclose(f);
+  e->dirty = false;
+  char msg[1024];
+  snprintf(msg, sizeof(msg), "Saved: %s", e->filename);
+  editor_set_status(e, msg);
+  return true;
+}
+
+static void editor_push_undo(Editor *e) {
+  if (e->undo_ptr >= UNDO_STACK_SIZE) {
+    // Free the oldest snapshot
+    EditorSnapshot *oldest = e->undo_stack[0];
+    for (int i = 0; i < oldest->line_count; i++) {
+      line_free(&oldest->lines[i]);
+    }
+    free(oldest->lines);
+    free(oldest);
+    for (int i = 0; i < UNDO_STACK_SIZE - 1; i++) {
+      e->undo_stack[i] = e->undo_stack[i + 1];
+    }
+    e->undo_ptr--;
+  }
+
+  EditorSnapshot *s = malloc(sizeof(EditorSnapshot));
+  s->line_count = e->line_count;
+  s->cursor_row = e->cursor_row;
+  s->cursor_col = e->cursor_col;
+  s->lines = malloc(sizeof(Line) * e->line_count);
+  for (int i = 0; i < e->line_count; i++) {
+    line_clone(&s->lines[i], &e->lines[i]);
+  }
+  e->undo_stack[e->undo_ptr++] = s;
+}
+
+static void editor_undo(Editor *e, FT_Face face) {
+  if (e->undo_ptr <= 0) return;
+  EditorSnapshot *s = e->undo_stack[--e->undo_ptr];
+
+  // Free current state
+  for (int i = 0; i < e->line_count; i++) {
+    line_free(&e->lines[i]);
+  }
+
+  e->line_count = s->line_count;
+  e->cursor_row = s->cursor_row;
+  e->cursor_col = s->cursor_col;
+  // We can just take the pointers from the snapshot instead of cloning back
+  free(e->lines);
+  e->lines = s->lines;
+  e->line_capacity = s->line_count; // Simplified
+  update_gutter_width(e, face);
+
+  for (int i = 0; i < e->line_count; i++) {
+    rebuild_line_cache(e, face, &e->lines[i]);
+  }
+
+  free(s);
+  refresh_preferred_x(e);
+}
+
+static bool editor_load(Editor *e, FT_Face face, const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return false;
+
+  for (int i = 0; i < e->line_count; i++)
+    line_free(&e->lines[i]);
+  e->line_count = 0;
+
+  if (!editor_ensure_lines(e, 1))
+    goto fail;
+
+  if (!line_init(&e->lines[0]))
+    goto fail;
+  e->line_count = 1;
+
+  int c;
+  while ((c = fgetc(f)) != EOF) {
+    if (c == '\n') {
+      if (!editor_ensure_lines(e, 1))
+        goto fail;
+      if (!line_init(&e->lines[e->line_count]))
+        goto fail;
+      e->line_count++;
+    } else {
+      char ch = (char)c;
+      Line *l = &e->lines[e->line_count - 1];
+      line_insert_bytes(l, line_length(l), &ch, 1);
+    }
+  }
+  fclose(f);
+  update_gutter_width(e, face);
+
+  for (int i = 0; i < e->line_count; i++)
+    rebuild_line_cache(e, face, &e->lines[i]);
+
+  e->cursor_row = 0;
+  e->cursor_col = 0;
+  e->scroll_row = 0;
+  e->preferred_x = e->text_x;
+  e->selection_active = false;
+  e->dirty = false;
+  snprintf(e->filename, sizeof(e->filename), "%s", path);
+  return true;
+
+fail:
+  fclose(f);
+  return false;
+}
+
+static void editor_duplicate_line(Editor *e, FT_Face face) {
+  if (!editor_ensure_lines(e, 1))
+    return;
+
+  Line *src = &e->lines[e->cursor_row];
+  int src_len = line_length(src);
+
+  for (int i = e->line_count; i > e->cursor_row + 1; i--)
+    e->lines[i] = e->lines[i - 1];
+
+  Line new_line;
+  if (!line_init(&new_line))
+    return;
+
+  if (src_len > 0 && line_ensure_gap(&new_line, src_len)) {
+    for (int i = 0; i < src_len; i++)
+      new_line.data[i] = line_char_at(src, i);
+    new_line.gap_start = src_len;
+    new_line.gap_end = new_line.capacity;
+  }
+  rebuild_line_cache(e, face, &new_line);
+  e->lines[e->cursor_row + 1] = new_line;
+  e->line_count++;
+  update_gutter_width(e, face);
+  e->cursor_row++;
+  e->dirty = true;
+}
+
+static void editor_move_line_up(Editor *e, FT_Face face) {
+  if (e->cursor_row == 0)
+    return;
+  Line tmp = e->lines[e->cursor_row];
+  e->lines[e->cursor_row] = e->lines[e->cursor_row - 1];
+  e->lines[e->cursor_row - 1] = tmp;
+  rebuild_line_cache(e, face, &e->lines[e->cursor_row]);
+  rebuild_line_cache(e, face, &e->lines[e->cursor_row - 1]);
+  e->cursor_row--;
+  int new_len = line_length(&e->lines[e->cursor_row]);
+  if (e->cursor_col > new_len)
+    e->cursor_col = new_len;
+  if (e->cursor_row < e->scroll_row)
+    e->scroll_row = e->cursor_row;
+  e->dirty = true;
+}
+
+static void editor_move_line_down(Editor *e, FT_Face face) {
+  if (e->cursor_row >= e->line_count - 1)
+    return;
+  Line tmp = e->lines[e->cursor_row];
+  e->lines[e->cursor_row] = e->lines[e->cursor_row + 1];
+  e->lines[e->cursor_row + 1] = tmp;
+  rebuild_line_cache(e, face, &e->lines[e->cursor_row]);
+  rebuild_line_cache(e, face, &e->lines[e->cursor_row + 1]);
+  e->cursor_row++;
+  int new_len = line_length(&e->lines[e->cursor_row]);
+  if (e->cursor_col > new_len)
+    e->cursor_col = new_len;
+  e->dirty = true;
+}
+
+static void editor_toggle_comment(Editor *e, FT_Face face) {
+  Line *l = &e->lines[e->cursor_row];
+  int len = line_length(l);
+
+  int first_non_space = 0;
+  while (first_non_space < len) {
+    char c = line_char_at(l, first_non_space);
+    if (c != ' ' && c != '\t')
+      break;
+    first_non_space++;
+  }
+
+  bool has_comment = (first_non_space + 1 < len &&
+                      line_char_at(l, first_non_space) == '/' &&
+                      line_char_at(l, first_non_space + 1) == '/');
+
+  if (has_comment) {
+    int skip = 2;
+    if (first_non_space + 2 < len && line_char_at(l, first_non_space + 2) == ' ')
+      skip = 3;
+    line_delete_bytes(l, first_non_space, skip);
+    if (e->cursor_col > first_non_space)
+      e->cursor_col -= skip;
+    if (e->cursor_col < 0)
+      e->cursor_col = 0;
+  } else {
+    const char *prefix = "// ";
+    line_insert_bytes(l, first_non_space, prefix, 3);
+    if (e->cursor_col >= first_non_space)
+      e->cursor_col += 3;
+  }
+  rebuild_line_cache(e, face, l);
+  e->dirty = true;
+}
+
+static void editor_indent_selection(Editor *e, FT_Face face, bool unindent) {
+  if (!e->selection_active) {
+    Line *l = &e->lines[e->cursor_row];
+    if (unindent) {
+      int removed = 0;
+      for (int i = 0; i < 4; i++) {
+        if (line_char_at(l, 0) == ' ') {
+          line_delete_bytes(l, 0, 1);
+          removed++;
+        } else break;
+      }
+      e->cursor_col -= removed;
+      if (e->cursor_col < 0) e->cursor_col = 0;
+    } else {
+      line_insert_bytes(l, 0, "    ", 4);
+      e->cursor_col += 4;
+    }
+    rebuild_line_cache(e, face, l);
+    e->dirty = true;
+    return;
+  }
+
+  TextPos s = sel_start(e);
+  TextPos t = sel_end(e);
+  for (int row = s.row; row <= t.row; row++) {
+    Line *l = &e->lines[row];
+    if (unindent) {
+      int removed = 0;
+      for (int i = 0; i < 4; i++) {
+        if (line_char_at(l, 0) == ' ') {
+          line_delete_bytes(l, 0, 1);
+          removed++;
+        } else break;
+      }
+      if (row == s.row) {
+        s.col -= removed;
+        if (s.col < 0) s.col = 0;
+      }
+      if (row == t.row) {
+        t.col -= removed;
+        if (t.col < 0) t.col = 0;
+      }
+    } else {
+      line_insert_bytes(l, 0, "    ", 4);
+      if (row == s.row) s.col += 4;
+      if (row == t.row) t.col += 4;
+    }
+    rebuild_line_cache(e, face, l);
+  }
+  e->sel_anchor_row = s.row;
+  e->sel_anchor_col = s.col;
+  e->cursor_row = t.row;
+  e->cursor_col = t.col;
+  e->dirty = true;
+}
+
+static void editor_find(Editor *e, bool forward) {
+  if (e->prompt_buf[0] == '\0') return;
+
+  int start_row = e->cursor_row;
+  int start_col = forward ? e->cursor_col + 1 : e->cursor_col - 1;
+  if (start_col < 0) start_col = 0;
+
+  for (int i = 0; i < e->line_count; i++) {
+    int row = (forward) ? (start_row + i) % e->line_count : (start_row - i + e->line_count) % e->line_count;
+    Line *l = &e->lines[row];
+    int ll = line_length(l);
+    
+    char *line_str = malloc((size_t)ll + 1);
+    for (int c = 0; c < ll; c++) line_str[c] = line_char_at(l, c);
+    line_str[ll] = '\0';
+
+    char *match = NULL;
+    if (row == start_row) {
+      if (forward) {
+        if (start_col < ll) match = strstr(line_str + start_col, e->prompt_buf);
+      } else {
+        char *last_match = NULL;
+        char *current_match = strstr(line_str, e->prompt_buf);
+        while (current_match && (current_match - line_str) < start_col) {
+          last_match = current_match;
+          current_match = strstr(current_match + 1, e->prompt_buf);
+        }
+        match = last_match;
+      }
+    } else {
+      match = strstr(line_str, e->prompt_buf);
+    }
+
+    if (match) {
+      e->cursor_row = row;
+      e->cursor_col = (int)(match - line_str);
+      e->scroll_row = e->cursor_row - 5;
+      if (e->scroll_row < 0) e->scroll_row = 0;
+      refresh_preferred_x(e);
+      free(line_str);
+      return;
+    }
+    free(line_str);
+  }
+}
+
+static void editor_replace(Editor *e, FT_Face face) {
+  if (e->prompt_buf[0] == '\0') return;
+  
+  Line *l = &e->lines[e->cursor_row];
+  int ll = line_length(l);
+  char *line_str = malloc((size_t)ll + 1);
+  for (int c = 0; c < ll; c++) line_str[c] = line_char_at(l, c);
+  line_str[ll] = '\0';
+
+  char *match = strstr(line_str + e->cursor_col, e->prompt_buf);
+  if (match && (match - line_str) == e->cursor_col) {
+    editor_push_undo(e);
+    line_delete_bytes(l, e->cursor_col, (int)strlen(e->prompt_buf));
+    line_insert_bytes(l, e->cursor_col, e->replace_buf, (int)strlen(e->replace_buf));
+    rebuild_line_cache(e, face, l);
+    e->dirty = true;
+    editor_find(e, true);
+  } else {
+    editor_find(e, true);
+  }
+  free(line_str);
+}
+
+static void render_dialog(SDL_Renderer *renderer, FT_Face face, Editor *e, SDL_Window *window) {
+  int ww, wh;
+  SDL_GetWindowSize(window, &ww, &wh);
+
+  int dw = 650;
+  int dh = (e->mode == MODE_REPLACE) ? 260 : 180;
+  int dx = (ww - dw) / 2;
+  int dy = (wh - dh) / 2;
+
+  // Background overlay (glassmorphism effect)
+  SDL_Rect overlay = {0, 0, ww, wh};
+  SDL_SetRenderDrawColor(renderer, 5, 5, 10, 200);
+  SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+  SDL_RenderFillRect(renderer, &overlay);
+
+  // Dialog shadow
+  SDL_Rect shadow = {dx + 5, dy + 5, dw, dh};
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 100);
+  SDL_RenderFillRect(renderer, &shadow);
+
+  // Dialog box
+  SDL_Rect rect = {dx, dy, dw, dh};
+  SDL_SetRenderDrawColor(renderer, 30, 30, 45, 255);
+  SDL_RenderFillRect(renderer, &rect);
+  
+  // Header / Accent bar
+  SDL_Rect header = {dx, dy, dw, 4};
+  SDL_SetRenderDrawColor(renderer, 100, 150, 255, 255);
+  SDL_RenderFillRect(renderer, &header);
+
+  SDL_SetRenderDrawColor(renderer, 60, 60, 80, 255);
+  SDL_RenderDrawRect(renderer, &rect);
+
+  const char *title = "DIALOG";
+  if (e->mode == MODE_SAVE_PROMPT) title = "SAVE FILE AS";
+  else if (e->mode == MODE_OPEN_PROMPT) title = "OPEN FILE";
+  else if (e->mode == MODE_FIND) title = "FIND IN FILE";
+  else if (e->mode == MODE_REPLACE) title = "FIND AND REPLACE";
+
+  int tx = dx + 30;
+  int ty = dy + 45;
+  for (int i = 0; title[i]; i++) {
+    render_glyph(renderer, face, (uint32_t)(unsigned char)title[i], &tx, ty, 255, 255, 255, 255);
+  }
+
+  // Input field 1
+  SDL_Rect input_rect = {dx + 30, dy + 75, dw - 60, 45};
+  SDL_SetRenderDrawColor(renderer, 15, 15, 25, 255);
+  SDL_RenderFillRect(renderer, &input_rect);
+  
+  // Border for active/inactive field
+  if (e->mode != MODE_REPLACE || e->prompt_cursor == 0)
+    SDL_SetRenderDrawColor(renderer, 100, 150, 255, 255);
+  else
+    SDL_SetRenderDrawColor(renderer, 60, 60, 80, 255);
+  SDL_RenderDrawRect(renderer, &input_rect);
+
+  int ix = dx + 45;
+  int iy = dy + 105;
+  for (int i = 0; e->prompt_buf[i]; i++) {
+    render_glyph(renderer, face, (uint32_t)(unsigned char)e->prompt_buf[i], &ix, iy, 200, 220, 255, 255);
+  }
+  
+  if (e->mode == MODE_REPLACE) {
+    // Input field 2 (Replace with)
+    SDL_Rect input_rect2 = {dx + 30, dy + 155, dw - 60, 45};
+    SDL_SetRenderDrawColor(renderer, 15, 15, 25, 255);
+    SDL_RenderFillRect(renderer, &input_rect2);
+    
+    if (e->prompt_cursor == 1)
+      SDL_SetRenderDrawColor(renderer, 100, 255, 150, 255);
+    else
+      SDL_SetRenderDrawColor(renderer, 60, 60, 80, 255);
+    SDL_RenderDrawRect(renderer, &input_rect2);
+
+    int ix2 = dx + 45;
+    int iy2 = dy + 185;
+    for (int i = 0; e->replace_buf[i]; i++) {
+      render_glyph(renderer, face, (uint32_t)(unsigned char)e->replace_buf[i], &ix2, iy2, 200, 255, 200, 255);
+    }
+    
+    // Labels
+    int lx = dx + 35;
+    int ly = dy + 70;
+    const char *find_label = "FIND";
+    for (int i = 0; find_label[i]; i++) render_glyph(renderer, face, find_label[i], &lx, ly, 120, 150, 180, 255);
+    
+    lx = dx + 35;
+    ly = dy + 150;
+    const char *replace_label = "REPLACE WITH";
+    for (int i = 0; replace_label[i]; i++) render_glyph(renderer, face, replace_label[i], &lx, ly, 120, 180, 150, 255);
+  }
+
+  // Prompt cursor
+  if ((SDL_GetTicks() / 500) % 2) {
+    if (e->mode == MODE_REPLACE && e->prompt_cursor == 1) {
+      int rx = dx + 45;
+      for (int i = 0; e->replace_buf[i]; i++) {
+        uint32_t cp = (uint32_t)(unsigned char)e->replace_buf[i];
+        if (cp == ' ' || cp == '\t') rx += 16;
+        else if (FT_Load_Char(face, cp, FT_LOAD_DEFAULT) == 0) rx += (int)(face->glyph->advance.x >> 6);
+        else rx += 8;
+      }
+      SDL_Rect c_rect = {rx, dy + 162, 2, 30};
+      SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+      SDL_RenderFillRect(renderer, &c_rect);
+    } else {
+      int rx = dx + 45;
+      for (int i = 0; e->prompt_buf[i]; i++) {
+        uint32_t cp = (uint32_t)(unsigned char)e->prompt_buf[i];
+        if (cp == ' ' || cp == '\t') rx += 16;
+        else if (FT_Load_Char(face, cp, FT_LOAD_DEFAULT) == 0) rx += (int)(face->glyph->advance.x >> 6);
+        else rx += 8;
+      }
+      SDL_Rect c_rect = {rx, dy + 82, 2, 30};
+      SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+      SDL_RenderFillRect(renderer, &c_rect);
+    }
+  }
+
+  // Footer Options
+  int ox = dx + 30;
+  int oy = dy + dh - 15;
+  const char *opt1 = "[ENTER] CONFIRM";
+  if (e->mode == MODE_FIND) opt1 = "[ENTER] FIND NEXT";
+  if (e->mode == MODE_REPLACE) opt1 = "[ENTER] REPLACE";
+  const char *opt_close = "[ESC] CANCEL";
+  
+  for (int i = 0; opt1[i]; i++) {
+    render_glyph(renderer, face, (uint32_t)(unsigned char)opt1[i], &ox, oy, 150, 255, 150, 255);
+  }
+  ox += 40;
+  if (e->mode == MODE_REPLACE) {
+    const char *opt_tab = "[TAB] SWITCH FIELD";
+    for (int i = 0; opt_tab[i]; i++) render_glyph(renderer, face, (uint32_t)(unsigned char)opt_tab[i], &ox, oy, 150, 150, 255, 255);
+    ox += 40;
+  }
+  for (int i = 0; opt_close[i]; i++) {
+    render_glyph(renderer, face, (uint32_t)(unsigned char)opt_close[i], &ox, oy, 255, 150, 150, 255);
+  }
+}
+
+static void render_status_bar(SDL_Renderer *renderer, FT_Face face,
+                              const Editor *e, SDL_Window *window) {
+  int ww, wh;
+  SDL_GetWindowSize(window, &ww, &wh);
+  int bar_y = wh - STATUS_BAR_HEIGHT;
+
+  SDL_Rect bar = {0, bar_y, ww, STATUS_BAR_HEIGHT};
+  SDL_SetRenderDrawColor(renderer, 35, 35, 55, 255);
+  SDL_RenderFillRect(renderer, &bar);
+
+  char left[1024];
+  const char *dirty_mark = e->dirty ? " [+]" : "";
+  snprintf(left, sizeof(left), " %s%s", e->filename, dirty_mark);
+
+  char right[128];
+  snprintf(right, sizeof(right), "Ln %d, Col %d  ",
+           e->cursor_row + 1, e->cursor_col + 1);
+
+  int x = 10;
+  int text_y = bar_y + STATUS_BAR_HEIGHT - 6;
+
+  for (int i = 0; left[i]; i++) {
+    uint32_t cp = (uint32_t)(unsigned char)left[i];
+    render_glyph(renderer, face, cp, &x, text_y, 200, 200, 220, 255);
+  }
+
+  Uint32 elapsed = SDL_GetTicks() - e->status_msg_time;
+  if (elapsed < 3000 && e->status_msg[0]) {
+    int mx = ww / 2 - 100;
+    for (int i = 0; e->status_msg[i]; i++) {
+      uint32_t cp = (uint32_t)(unsigned char)e->status_msg[i];
+      render_glyph(renderer, face, cp, &mx, text_y, 100, 220, 120, 255);
+    }
+  }
+
+  char mode_text[32];
+  snprintf(mode_text, sizeof(mode_text), "[ %s ]", 
+           (e->mode == MODE_EDIT) ? "EDIT" : (e->mode == MODE_VIEW) ? "VIEW" : "PROMPT");
+  int mode_rx = ww - 350;
+  for (int i = 0; mode_text[i]; i++) {
+    uint32_t cp = (uint32_t)(unsigned char)mode_text[i];
+    render_glyph(renderer, face, cp, &mode_rx, text_y, 
+                 (e->mode == MODE_EDIT) ? 255 : 100, 
+                 (e->mode == MODE_EDIT) ? 100 : 200, 
+                 (e->mode == MODE_EDIT) ? 100 : 255, 255);
+  }
+
+  int rx = ww - (int)strlen(right) * 14;
+  for (int i = 0; right[i]; i++) {
+    uint32_t cp = (uint32_t)(unsigned char)right[i];
+    render_glyph(renderer, face, cp, &rx, text_y, 160, 160, 180, 255);
+  }
+}
+
+
+
+int main(int argc, char *argv[]) {
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     SDL_Log("SDL_Init failed: %s", SDL_GetError());
     return 1;
@@ -546,15 +1257,32 @@ int main(void) {
   editor.line_capacity = LINES_INITIAL_CAPACITY;
   editor.line_count = 1;
   editor.clipboard = calloc(CLIPBOARD_MAX, 1);
+  snprintf(editor.filename, sizeof(editor.filename), "%s", DEFAULT_FILENAME);
 
   editor.lines = calloc((size_t)editor.line_capacity, sizeof(Line));
   if (!editor.lines || !editor.clipboard)
     goto cleanup;
 
-  if (!line_init(&editor.lines[0]))
-    goto cleanup;
-  rebuild_line_cache(face, &editor.lines[0]);
-  editor.preferred_x = TEXT_X_ORIGIN;
+  if (argc >= 2) {
+    if (!editor_load(&editor, face, argv[1])) {
+      if (!line_init(&editor.lines[0]))
+        goto cleanup;
+      rebuild_line_cache(&editor, face, &editor.lines[0]);
+      snprintf(editor.filename, sizeof(editor.filename), "%s", argv[1]);
+      editor_set_status(&editor, "New file");
+    }
+  } else {
+    if (!line_init(&editor.lines[0]))
+      goto cleanup;
+    rebuild_line_cache(&editor, face, &editor.lines[0]);
+  }
+
+  editor.preferred_x = editor.text_x;
+  update_gutter_width(&editor, face);
+  editor.preferred_x = editor.text_x;
+  
+  // Re-rebuild initial line cache with correct text_x
+  rebuild_line_cache(&editor, face, &editor.lines[0]);
 
   bool running = true;
   Uint32 last_blink = SDL_GetTicks();
@@ -597,8 +1325,8 @@ int main(void) {
             clicked_row = editor.line_count - 1;
           editor.cursor_row = clicked_row;
           editor.cursor_col =
-              get_closest_column(&editor.lines[clicked_row], mx);
-          editor.preferred_x = get_line_x_position(
+              get_closest_column(&editor, &editor.lines[clicked_row], mx);
+          editor.preferred_x = get_line_x_position(&editor,
               &editor.lines[editor.cursor_row], editor.cursor_col);
           editor_clear_selection(&editor);
           cursor_moving = true;
@@ -608,6 +1336,16 @@ int main(void) {
       }
 
       case SDL_TEXTINPUT: {
+        if (editor.mode != MODE_EDIT && editor.mode != MODE_VIEW) {
+          if (editor.mode == MODE_REPLACE && editor.prompt_cursor == 1) {
+            strncat(editor.replace_buf, ev.text.text, sizeof(editor.replace_buf) - strlen(editor.replace_buf) - 1);
+          } else {
+            strncat(editor.prompt_buf, ev.text.text, sizeof(editor.prompt_buf) - strlen(editor.prompt_buf) - 1);
+          }
+          break;
+        }
+        if (editor.mode != MODE_EDIT) break;
+        editor_push_undo(&editor);
         if (editor.selection_active)
           editor_delete_selection(&editor, face);
         Line *line = &editor.lines[editor.cursor_row];
@@ -616,8 +1354,9 @@ int main(void) {
             line_insert_bytes(line, editor.cursor_col, ev.text.text,
                               inserted_bytes)) {
           editor.cursor_col += inserted_bytes;
-          rebuild_line_cache(face, line);
-          editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+          rebuild_line_cache(&editor, face, line);
+          editor.preferred_x = get_line_x_position(&editor,line, editor.cursor_col);
+          editor.dirty = true;
         }
         break;
       }
@@ -629,12 +1368,118 @@ int main(void) {
 
         bool shift = (mod & KMOD_SHIFT) != 0;
         bool ctrl = (mod & KMOD_CTRL) != 0;
+        bool alt = (mod & KMOD_ALT) != 0;
+
+        if (editor.mode != MODE_VIEW && editor.mode != MODE_EDIT) {
+          if (sym == SDLK_RETURN) {
+            if (editor.mode == MODE_SAVE_PROMPT) {
+              if (editor.prompt_buf[0]) {
+                snprintf(editor.filename, sizeof(editor.filename), "%s", editor.prompt_buf);
+                editor_save(&editor);
+              }
+            } else if (editor.mode == MODE_OPEN_PROMPT) {
+              if (editor.prompt_buf[0]) {
+                editor_load(&editor, face, editor.prompt_buf);
+              }
+            } else if (editor.mode == MODE_FIND) {
+              editor_find(&editor, true);
+              continue; // Keep in find mode
+            } else if (editor.mode == MODE_REPLACE) {
+              editor_replace(&editor, face);
+              continue; // Keep in replace mode
+            }
+            editor.mode = MODE_VIEW;
+          } else if (sym == SDLK_ESCAPE) {
+            editor.mode = MODE_VIEW;
+          } else if (sym == SDLK_BACKSPACE) {
+            if (editor.mode == MODE_REPLACE && editor.prompt_cursor == 1) {
+              size_t len = strlen(editor.replace_buf);
+              if (len > 0) editor.replace_buf[len - 1] = '\0';
+            } else {
+              size_t len = strlen(editor.prompt_buf);
+              if (len > 0) editor.prompt_buf[len - 1] = '\0';
+            }
+          } else if (sym == SDLK_TAB && editor.mode == MODE_REPLACE) {
+            editor.prompt_cursor = (editor.prompt_cursor + 1) % 2;
+          }
+          break;
+        }
+
+        if (editor.mode == MODE_VIEW) {
+          if (sym == SDLK_i) {
+            editor.mode = MODE_EDIT;
+            editor_set_status(&editor, "-- EDIT MODE --");
+            break;
+          }
+        } else if (editor.mode == MODE_EDIT) {
+          if (sym == SDLK_ESCAPE) {
+            editor.mode = MODE_VIEW;
+            editor_set_status(&editor, "-- VIEW MODE --");
+            break;
+          }
+        }
+
+        if (ctrl && sym == SDLK_f) {
+          editor.mode = MODE_FIND;
+          editor.prompt_buf[0] = '\0';
+          break;
+        }
+
+        if (ctrl && sym == SDLK_h) {
+          editor.mode = MODE_REPLACE;
+          editor.prompt_buf[0] = '\0';
+          editor.replace_buf[0] = '\0';
+          editor.prompt_cursor = 0;
+          break;
+        }
+
+        if (editor.mode == MODE_VIEW && !ctrl && !alt) {
+           // Basic navigation allowed in view mode
+           if (sym != SDLK_UP && sym != SDLK_DOWN && sym != SDLK_LEFT && sym != SDLK_RIGHT &&
+               sym != SDLK_HOME && sym != SDLK_END && sym != SDLK_PAGEUP && sym != SDLK_PAGEDOWN) {
+             break; 
+           }
+        }
+
+        if (ctrl && sym == SDLK_z) {
+          editor_undo(&editor, face);
+          break;
+        }
+
+        if (ctrl && sym == SDLK_s) {
+          editor.mode = MODE_SAVE_PROMPT;
+          snprintf(editor.prompt_buf, sizeof(editor.prompt_buf), "%s", editor.filename);
+          break;
+        }
+
+        if (ctrl && sym == SDLK_o) {
+          editor.mode = MODE_OPEN_PROMPT;
+          editor.prompt_buf[0] = '\0';
+          break;
+        }
+
+        if (ctrl && sym == SDLK_n) {
+          editor_push_undo(&editor);
+          for (int i = 0; i < editor.line_count; i++)
+            line_free(&editor.lines[i]);
+          editor.line_count = 1;
+          line_init(&editor.lines[0]);
+          rebuild_line_cache(&editor, face, &editor.lines[0]);
+          editor.cursor_row = 0;
+          editor.cursor_col = 0;
+          editor.scroll_row = 0;
+          snprintf(editor.filename, sizeof(editor.filename), "%s", DEFAULT_FILENAME);
+          editor.dirty = false;
+          editor_set_status(&editor, "New File");
+          break;
+        }
 
         if (sym == SDLK_BACKSPACE) {
+          editor_push_undo(&editor);
           if (editor.selection_active) {
             editor_delete_selection(&editor, face);
             line = &editor.lines[editor.cursor_row];
-            rebuild_line_cache(face, line);
+            rebuild_line_cache(&editor, face, line);
           } else if (editor.cursor_col > 0) {
             int delete_start = editor.cursor_col;
             if (ctrl) {
@@ -664,8 +1509,9 @@ int main(void) {
             int delete_len = editor.cursor_col - delete_start;
             line_delete_bytes(line, delete_start, delete_len);
             editor.cursor_col = delete_start;
-            rebuild_line_cache(face, line);
-            editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+            rebuild_line_cache(&editor, face, line);
+            editor.preferred_x = get_line_x_position(&editor,line, editor.cursor_col);
+            editor.dirty = true;
           } else if (editor.cursor_row > 0) {
             int prev_row = editor.cursor_row - 1;
             Line *prev_line = &editor.lines[prev_row];
@@ -682,27 +1528,30 @@ int main(void) {
             memcpy(&prev_line->data[prev_line->gap_start], line->data,
                    (size_t)cur_len);
             prev_line->gap_start += cur_len;
-            rebuild_line_cache(face, prev_line);
+            rebuild_line_cache(&editor, face, prev_line);
             line_free(line);
 
             for (int i = editor.cursor_row; i < editor.line_count - 1; i++)
               editor.lines[i] = editor.lines[i + 1];
             memset(&editor.lines[editor.line_count - 1], 0, sizeof(Line));
             editor.line_count--;
+            update_gutter_width(&editor, face);
             editor.cursor_row = prev_row;
             editor.cursor_col = prev_len;
-            editor.preferred_x = get_line_x_position(
+            editor.preferred_x = get_line_x_position(&editor,
                 &editor.lines[editor.cursor_row], editor.cursor_col);
+            editor.dirty = true;
           }
           cursor_moving = true;
           cursor_visible = true;
         }
 
         else if (sym == SDLK_DELETE) {
+          editor_push_undo(&editor);
           if (editor.selection_active) {
             editor_delete_selection(&editor, face);
             line = &editor.lines[editor.cursor_row];
-            rebuild_line_cache(face, line);
+            rebuild_line_cache(&editor, face, line);
           } else {
             int len = line_length(line);
             if (editor.cursor_col < len) {
@@ -731,8 +1580,9 @@ int main(void) {
               }
               line_delete_bytes(line, editor.cursor_col,
                                 delete_end - editor.cursor_col);
-              rebuild_line_cache(face, line);
-              editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+              rebuild_line_cache(&editor, face, line);
+              editor.preferred_x = get_line_x_position(&editor,line, editor.cursor_col);
+              editor.dirty = true;
             } else if (editor.cursor_row < editor.line_count - 1) {
               Line *next_line = &editor.lines[editor.cursor_row + 1];
               int next_len = line_length(next_line);
@@ -745,13 +1595,14 @@ int main(void) {
               memcpy(&line->data[line->gap_start], next_line->data,
                      (size_t)next_len);
               line->gap_start += next_len;
-              rebuild_line_cache(face, line);
+              rebuild_line_cache(&editor, face, line);
               line_free(next_line);
               for (int i = editor.cursor_row + 1; i < editor.line_count - 1;
                    i++)
                 editor.lines[i] = editor.lines[i + 1];
               memset(&editor.lines[editor.line_count - 1], 0, sizeof(Line));
               editor.line_count--;
+              editor.dirty = true;
             }
           }
           cursor_moving = true;
@@ -759,21 +1610,44 @@ int main(void) {
         }
 
         else if (sym == SDLK_TAB) {
-          if (editor.selection_active)
-            editor_delete_selection(&editor, face);
-          line = &editor.lines[editor.cursor_row];
-          const char *indent = "    ";
-          if (line_insert_bytes(line, editor.cursor_col, indent, 4)) {
-            editor.cursor_col += 4;
-            rebuild_line_cache(face, line);
-            editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+          editor_push_undo(&editor);
+          if (ctrl || alt) {
+            editor_indent_selection(&editor, face, shift);
+          } else if (editor.selection_active && shift) {
+            editor_indent_selection(&editor, face, true);
+          } else if (editor.selection_active) {
+            editor_indent_selection(&editor, face, false);
+          } else {
+            if (shift) {
+              editor_indent_selection(&editor, face, true);
+            } else {
+              if (editor.selection_active)
+                editor_delete_selection(&editor, face);
+              line = &editor.lines[editor.cursor_row];
+              const char *indent = "    ";
+              if (line_insert_bytes(line, editor.cursor_col, indent, 4)) {
+                editor.cursor_col += 4;
+                rebuild_line_cache(&editor, face, line);
+                editor.preferred_x = get_line_x_position(&editor,line, editor.cursor_col);
+                editor.dirty = true;
+              }
+            }
           }
         }
 
         else if (sym == SDLK_RETURN) {
+          editor_push_undo(&editor);
           if (editor.selection_active)
             editor_delete_selection(&editor, face);
           line = &editor.lines[editor.cursor_row];
+
+          int indent_len = 0;
+          while (indent_len < line_length(line)) {
+            char c = line_char_at(line, indent_len);
+            if (c != ' ' && c != '\t')
+              break;
+            indent_len++;
+          }
 
           if (!editor_ensure_lines(&editor, 1)) {
             running = false;
@@ -794,27 +1668,36 @@ int main(void) {
           if (split_len < 0)
             split_len = 0;
 
-          if (split_len > 0) {
-            if (!line_ensure_gap(&new_line, split_len)) {
-              line_free(&new_line);
-              running = false;
-              break;
-            }
-            for (int i = 0; i < split_len; i++)
-              new_line.data[i] = line_char_at(line, editor.cursor_col + i);
-            new_line.gap_start = split_len;
-            new_line.gap_end = new_line.capacity;
+          int total_new = split_len + indent_len;
+          if (total_new > 0 && !line_ensure_gap(&new_line, total_new)) {
+            line_free(&new_line);
+            running = false;
+            break;
           }
 
-          rebuild_line_cache(face, &new_line);
+          for (int i = 0; i < indent_len; i++)
+            new_line.data[new_line.gap_start + i] = line_char_at(line, i);
+          new_line.gap_start += indent_len;
+
+          if (split_len > 0) {
+            for (int i = 0; i < split_len; i++)
+              new_line.data[new_line.gap_start + i] =
+                  line_char_at(line, editor.cursor_col + i);
+            new_line.gap_start += split_len;
+          }
+
+          rebuild_line_cache(&editor, face, &new_line);
           line_truncate(line, editor.cursor_col);
-          rebuild_line_cache(face, line);
+          rebuild_line_cache(&editor, face, line);
 
           editor.lines[editor.cursor_row + 1] = new_line;
           editor.line_count++;
+          update_gutter_width(&editor, face);
           editor.cursor_row++;
-          editor.cursor_col = 0;
-          editor.preferred_x = TEXT_X_ORIGIN;
+          editor.cursor_col = indent_len;
+          editor.preferred_x = get_line_x_position(&editor,
+              &editor.lines[editor.cursor_row], editor.cursor_col);
+          editor.dirty = true;
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -829,9 +1712,20 @@ int main(void) {
             editor.cursor_row = 0;
             editor.cursor_col = 0;
           } else {
-            editor.cursor_col = 0;
+            int first_non_space = 0;
+            int ll = line_length(line);
+            while (first_non_space < ll) {
+              char c = line_char_at(line, first_non_space);
+              if (c != ' ' && c != '\t')
+                break;
+              first_non_space++;
+            }
+            if (editor.cursor_col == first_non_space)
+              editor.cursor_col = 0;
+            else
+              editor.cursor_col = first_non_space;
           }
-          editor.preferred_x = get_line_x_position(
+          editor.preferred_x = get_line_x_position(&editor,
               &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
@@ -848,7 +1742,7 @@ int main(void) {
           } else {
             editor.cursor_col = line_length(&editor.lines[editor.cursor_row]);
           }
-          editor.preferred_x = get_line_x_position(
+          editor.preferred_x = get_line_x_position(&editor,
               &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
@@ -866,8 +1760,7 @@ int main(void) {
           editor.scroll_row -= rows;
           if (editor.scroll_row < 0)
             editor.scroll_row = 0;
-          editor.cursor_col = get_closest_column(
-              &editor.lines[editor.cursor_row], editor.preferred_x);
+          editor.cursor_col = get_closest_column(&editor, &editor.lines[editor.cursor_row], editor.preferred_x);
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -887,8 +1780,7 @@ int main(void) {
             max_scroll = 0;
           if (editor.scroll_row > max_scroll)
             editor.scroll_row = max_scroll;
-          editor.cursor_col = get_closest_column(
-              &editor.lines[editor.cursor_row], editor.preferred_x);
+          editor.cursor_col = get_closest_column(&editor, &editor.lines[editor.cursor_row], editor.preferred_x);
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -930,7 +1822,7 @@ int main(void) {
             editor.cursor_row--;
             editor.cursor_col = line_length(&editor.lines[editor.cursor_row]);
           }
-          editor.preferred_x = get_line_x_position(
+          editor.preferred_x = get_line_x_position(&editor,
               &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
@@ -973,50 +1865,62 @@ int main(void) {
             editor.cursor_row++;
             editor.cursor_col = 0;
           }
-          editor.preferred_x = get_line_x_position(
+          editor.preferred_x = get_line_x_position(&editor,
               &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
 
         else if (sym == SDLK_UP) {
-          if (shift)
-            editor_start_selection(&editor);
-          else
-            editor_clear_selection(&editor);
-          Uint32 now = SDL_GetTicks();
-          if (now - editor.last_vertical_move > VERTICAL_MOVE_RESET_MS)
-            refresh_preferred_x(&editor);
-          editor.last_vertical_move = now;
-          if (editor.cursor_row > 0) {
-            editor.cursor_row--;
-            editor.cursor_col = get_closest_column(
-                &editor.lines[editor.cursor_row], editor.preferred_x);
-            if (editor.cursor_row < editor.scroll_row)
-              editor.scroll_row = editor.cursor_row;
+          if (alt && !shift) {
+            editor_push_undo(&editor);
+            editor_move_line_up(&editor, face);
             cursor_moving = true;
             cursor_visible = true;
+          } else {
+            if (shift)
+              editor_start_selection(&editor);
+            else
+              editor_clear_selection(&editor);
+            Uint32 now = SDL_GetTicks();
+            if (now - editor.last_vertical_move > VERTICAL_MOVE_RESET_MS)
+              refresh_preferred_x(&editor);
+            editor.last_vertical_move = now;
+            if (editor.cursor_row > 0) {
+              editor.cursor_row--;
+              editor.cursor_col = get_closest_column(&editor, &editor.lines[editor.cursor_row], editor.preferred_x);
+              if (editor.cursor_row < editor.scroll_row)
+                editor.scroll_row = editor.cursor_row;
+              cursor_moving = true;
+              cursor_visible = true;
+            }
           }
         }
 
         else if (sym == SDLK_DOWN) {
-          if (shift)
-            editor_start_selection(&editor);
-          else
-            editor_clear_selection(&editor);
-          Uint32 now = SDL_GetTicks();
-          if (now - editor.last_vertical_move > VERTICAL_MOVE_RESET_MS)
-            refresh_preferred_x(&editor);
-          editor.last_vertical_move = now;
-          if (editor.cursor_row < editor.line_count - 1) {
-            editor.cursor_row++;
-            editor.cursor_col = get_closest_column(
-                &editor.lines[editor.cursor_row], editor.preferred_x);
-            int vis = visible_rows(window);
-            if (editor.cursor_row >= editor.scroll_row + vis)
-              editor.scroll_row = editor.cursor_row - vis + 1;
+          if (alt && !shift) {
+            editor_push_undo(&editor);
+            editor_move_line_down(&editor, face);
             cursor_moving = true;
             cursor_visible = true;
+          } else {
+            if (shift)
+              editor_start_selection(&editor);
+            else
+              editor_clear_selection(&editor);
+            Uint32 now = SDL_GetTicks();
+            if (now - editor.last_vertical_move > VERTICAL_MOVE_RESET_MS)
+              refresh_preferred_x(&editor);
+            editor.last_vertical_move = now;
+            if (editor.cursor_row < editor.line_count - 1) {
+              editor.cursor_row++;
+              editor.cursor_col = get_closest_column(&editor, &editor.lines[editor.cursor_row], editor.preferred_x);
+              int vis = visible_rows(window);
+              if (editor.cursor_row >= editor.scroll_row + vis)
+                editor.scroll_row = editor.cursor_row - vis + 1;
+              cursor_moving = true;
+              cursor_visible = true;
+            }
           }
         }
 
@@ -1026,7 +1930,7 @@ int main(void) {
           editor.sel_anchor_col = 0;
           editor.cursor_row = editor.line_count - 1;
           editor.cursor_col = line_length(&editor.lines[editor.cursor_row]);
-          editor.preferred_x = get_line_x_position(
+          editor.preferred_x = get_line_x_position(&editor,
               &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
@@ -1041,19 +1945,22 @@ int main(void) {
         }
 
         else if (ctrl && sym == SDLK_x) {
+          editor_push_undo(&editor);
           if (editor.selection_active && editor.clipboard) {
             editor_selection_to_buf(&editor, editor.clipboard, CLIPBOARD_MAX);
             editor.clipboard_len = (int)strlen(editor.clipboard);
             SDL_SetClipboardText(editor.clipboard);
             editor_delete_selection(&editor, face);
             line = &editor.lines[editor.cursor_row];
-            rebuild_line_cache(face, line);
+            rebuild_line_cache(&editor, face, line);
+            editor.dirty = true;
           }
           cursor_moving = true;
           cursor_visible = true;
         }
 
         else if (ctrl && sym == SDLK_v) {
+          editor_push_undo(&editor);
           char *text = SDL_GetClipboardText();
           if (text && *text) {
             if (editor.selection_active)
@@ -1068,7 +1975,7 @@ int main(void) {
               if (seg_len > 0 &&
                   line_insert_bytes(line, editor.cursor_col, p, seg_len)) {
                 editor.cursor_col += seg_len;
-                rebuild_line_cache(face, line);
+                rebuild_line_cache(&editor, face, line);
               }
 
               if (nl) {
@@ -1090,9 +1997,9 @@ int main(void) {
                   new_line.gap_start = split_len;
                   new_line.gap_end = new_line.capacity;
                 }
-                rebuild_line_cache(face, &new_line);
+                rebuild_line_cache(&editor, face, &new_line);
                 line_truncate(line, editor.cursor_col);
-                rebuild_line_cache(face, line);
+                rebuild_line_cache(&editor, face, line);
 
                 editor.lines[editor.cursor_row + 1] = new_line;
                 editor.line_count++;
@@ -1105,45 +2012,35 @@ int main(void) {
               }
             }
             SDL_free(text);
-            editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+            editor.preferred_x = get_line_x_position(&editor,line, editor.cursor_col);
+            editor.dirty = true;
           }
           cursor_moving = true;
           cursor_visible = true;
         }
 
+        else if (ctrl && sym == SDLK_s) {
+          // Handled above in dialog logic, but keeping this for legacy if needed
+          // or if we want to bypass dialog if filename is already set.
+          // For now, let's just use the dialog.
+        }
+
         else if (ctrl && sym == SDLK_d) {
-          line = &editor.lines[editor.cursor_row];
-          int len = line_length(line);
-          if (editor.cursor_row < editor.line_count - 1) {
-            line_free(line);
-            for (int i = editor.cursor_row; i < editor.line_count - 1; i++)
-              editor.lines[i] = editor.lines[i + 1];
-            memset(&editor.lines[editor.line_count - 1], 0, sizeof(Line));
-            editor.line_count--;
-            if (editor.cursor_row >= editor.line_count)
-              editor.cursor_row = editor.line_count - 1;
-            int new_len = line_length(&editor.lines[editor.cursor_row]);
-            if (editor.cursor_col > new_len)
-              editor.cursor_col = new_len;
-          } else {
-            line_truncate(line, 0);
-            editor.cursor_col = 0;
-            rebuild_line_cache(face, line);
-          }
-          (void)len;
-          line = &editor.lines[editor.cursor_row];
-          rebuild_line_cache(face, line);
-          editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+          editor_push_undo(&editor);
+          editor_duplicate_line(&editor, face);
+          editor.preferred_x = get_line_x_position(&editor,
+              &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
 
         else if (ctrl && sym == SDLK_k) {
+          editor_push_undo(&editor);
           line = &editor.lines[editor.cursor_row];
           int len = line_length(line);
           if (editor.cursor_col < len) {
             line_truncate(line, editor.cursor_col);
-            rebuild_line_cache(face, line);
+            rebuild_line_cache(&editor, face, line);
           } else if (editor.cursor_row < editor.line_count - 1) {
             Line *next = &editor.lines[editor.cursor_row + 1];
             int next_len = line_length(next);
@@ -1153,7 +2050,7 @@ int main(void) {
               memcpy(&line->data[line->gap_start], next->data,
                      (size_t)next_len);
               line->gap_start += next_len;
-              rebuild_line_cache(face, line);
+              rebuild_line_cache(&editor, face, line);
             }
             line_free(next);
             for (int i = editor.cursor_row + 1; i < editor.line_count - 1; i++)
@@ -1161,7 +2058,40 @@ int main(void) {
             memset(&editor.lines[editor.line_count - 1], 0, sizeof(Line));
             editor.line_count--;
           }
-          editor.preferred_x = get_line_x_position(line, editor.cursor_col);
+          editor.preferred_x = get_line_x_position(&editor,line, editor.cursor_col);
+          editor.dirty = true;
+          cursor_moving = true;
+          cursor_visible = true;
+        }
+
+        else if (ctrl && sym == SDLK_l) {
+          editor.cursor_col = 0;
+          int vis = visible_rows(window);
+          int target_scroll = editor.cursor_row - vis / 2;
+          if (target_scroll < 0)
+            target_scroll = 0;
+          int max_scroll = editor.line_count - vis;
+          if (max_scroll < 0)
+            max_scroll = 0;
+          if (target_scroll > max_scroll)
+            target_scroll = max_scroll;
+          editor.scroll_row = target_scroll;
+          editor.preferred_x = get_line_x_position(&editor,
+              &editor.lines[editor.cursor_row], editor.cursor_col);
+          cursor_moving = true;
+          cursor_visible = true;
+        }
+
+        else if (ctrl && sym == SDLK_n) {
+          // Duplicate line was here, now moved to Ctrl+Shift+D or handled above as New File
+          // Handled above as New File
+        }
+
+        else if (ctrl && sym == SDLK_SLASH) {
+          editor_push_undo(&editor);
+          editor_toggle_comment(&editor, face);
+          editor.preferred_x = get_line_x_position(&editor,
+              &editor.lines[editor.cursor_row], editor.cursor_col);
           cursor_moving = true;
           cursor_visible = true;
         }
@@ -1192,7 +2122,6 @@ int main(void) {
     TextPos sel_s = sel_start(&editor);
     TextPos sel_t = sel_end(&editor);
 
-    int y = FIRST_LINE_Y;
     for (int row = editor.scroll_row;
          row < editor.line_count && row < editor.scroll_row + vis_rows; row++) {
 
@@ -1203,16 +2132,26 @@ int main(void) {
         if (row_selected) {
           Line *sl = &editor.lines[row];
           int slen = line_length(sl);
-          int x0 = (row == sel_s.row) ? get_line_x_position(sl, sel_s.col)
-                                      : TEXT_X_ORIGIN;
-          int x1 = (row == sel_t.row) ? get_line_x_position(sl, sel_t.col)
-                                      : get_line_x_position(sl, slen) + 8;
+          int x0 = (row == sel_s.row) ? get_line_x_position(&editor,sl, sel_s.col)
+                                      : editor.text_x;
+          int x1 = (row == sel_t.row) ? get_line_x_position(&editor,sl, sel_t.col)
+                                      : get_line_x_position(&editor,sl, slen) + 8;
           SDL_Rect sel_rect = {x0, screen_y - 20, x1 - x0, 28};
           SDL_SetRenderDrawColor(renderer, 60, 100, 180, 120);
           SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
           SDL_RenderFillRect(renderer, &sel_rect);
           SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
         }
+      }
+
+      if (row == editor.cursor_row) {
+        int ww;
+        SDL_GetWindowSize(window, &ww, NULL);
+        SDL_Rect hl = {0, screen_y - 20, ww, 28};
+        SDL_SetRenderDrawColor(renderer, 40, 40, 55, 255);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_RenderFillRect(renderer, &hl);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
       }
 
       char num_buf[16];
@@ -1230,26 +2169,39 @@ int main(void) {
           g = 200;
           b = 60;
         }
-        render_glyph(renderer, face, cp, &num_x, screen_y, r, g, b);
+        render_glyph(renderer, face, cp, &num_x, screen_y, r, g, b, 255);
       }
 
       Line *l = &editor.lines[row];
-      int x = TEXT_X_ORIGIN;
+      int x = editor.text_x;
       int ll = line_length(l);
+      int token_len = 0;
+      TokenType current_token = TOKEN_TEXT;
       for (int col = 0; col < ll;) {
+        if (token_len <= 0) {
+          current_token = get_token_at(l, col, &token_len);
+        }
         uint32_t cp = 0;
         int bytes = 0;
         if (!line_decode_codepoint(l, col, &cp, &bytes) || bytes <= 0) {
           cp = 0xFFFD;
           bytes = 1;
         }
-        render_glyph(renderer, face, cp, &x, screen_y, 255, 255, 255);
+        Uint8 r = 220, g = 220, b = 220;
+        switch (current_token) {
+          case TOKEN_KEYWORD: r = 255; g = 100; b = 150; break;
+          case TOKEN_TYPE: r = 100; g = 200; b = 255; break;
+          case TOKEN_STRING: r = 230; g = 230; b = 100; break;
+          case TOKEN_COMMENT: r = 100; g = 180; b = 100; break;
+          case TOKEN_NUMBER: r = 255; g = 180; b = 100; break;
+          case TOKEN_PREPROCESSOR: r = 200; g = 150; b = 255; break;
+          default: break;
+        }
+        render_glyph(renderer, face, cp, &x, screen_y, r, g, b, 255);
         col += bytes;
+        token_len -= bytes;
       }
-
-      y += LINE_HEIGHT_PX;
     }
-    (void)y;
 
     if (editor.cursor_row >= editor.scroll_row &&
         editor.cursor_row < editor.scroll_row + vis_rows) {
@@ -1257,13 +2209,19 @@ int main(void) {
           FIRST_LINE_Y +
           (editor.cursor_row - editor.scroll_row) * LINE_HEIGHT_PX;
       Line *cursor_line = &editor.lines[editor.cursor_row];
-      int cursor_x = get_line_x_position(cursor_line, editor.cursor_col);
+      int cursor_x = get_line_x_position(&editor,cursor_line, editor.cursor_col);
 
       if (cursor_visible) {
         SDL_Rect rect = {cursor_x, cursor_screen_y - 20, 2, 28};
         SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
         SDL_RenderFillRect(renderer, &rect);
       }
+    }
+
+    render_status_bar(renderer, face, &editor, window);
+
+    if (editor.mode != MODE_EDIT && editor.mode != MODE_VIEW) {
+      render_dialog(renderer, face, &editor, window);
     }
 
     SDL_RenderPresent(renderer);
