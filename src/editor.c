@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "formatter.h"
+#include "language.h"
+#include "save_pipeline.h"
 #include "storage.h"
 
 /* =====================================================================
@@ -918,6 +921,7 @@ typedef struct {
 
   char filename[1024];
   bool dirty;
+  LangID lang; /* detected language for current file */
 
   char status_msg[1024];
   Uint32 status_msg_time;
@@ -1842,14 +1846,25 @@ static void editor_bracket_match(Editor *e) {
 /* =====================================================================
  * Save / load
  * ===================================================================== */
+
+/* Reload the LineBuf from a flat byte buffer without touching storage.
+   Used after formatting changes the document text. */
+static bool editor_reload_from_bytes(Editor *e, GlyphCache *gc,
+                                     const char *text, size_t len) {
+  return editor_deserialize(e, gc, (const uint8_t *)text, len);
+}
+
 static bool editor_do_save(Editor *e, GlyphCache *gc) {
-  (void)gc;
   if (!e->storage) {
     editor_set_status(e, "No storage session");
     return false;
   }
-  ByteBuffer doc;
-  editor_serialize(e, &doc);
+
+  /* Flatten current buffer */
+  ByteBuffer raw;
+  editor_serialize(e, &raw);
+
+  /* Fill metadata title from filename if not set */
   if (e->doc_meta.title[0] == '\0') {
     const char *base = strrchr(e->filename, '/');
     base = base ? base + 1 : e->filename;
@@ -1859,20 +1874,84 @@ static bool editor_do_save(Editor *e, GlyphCache *gc) {
     memcpy(e->doc_meta.title, base, cl);
     e->doc_meta.title[cl] = '\0';
   }
-  StorageStatus st = storage_save(e->storage, e->filename, &doc, &e->doc_meta);
-  bytebuffer_free(&doc);
-  if (st != STORAGE_OK) {
-    char msg[1024];
-    snprintf(msg, sizeof(msg), "Save failed: %s", storage_status_string(st));
+
+  /* Build pipeline context */
+  PipelineCtx ctx = {
+      .text = (const char *)raw.data,
+      .text_len = raw.len,
+      .lang = e->lang,
+      .filepath = e->filename,
+      .storage = e->storage,
+      .meta = &e->doc_meta,
+      .flags = PIPE_FLAG_NONE,
+  };
+
+  char *formatted_text = NULL;
+  size_t formatted_len = 0;
+  PipelineResult pr = pipeline_run(&ctx, &formatted_text, &formatted_len);
+  bytebuffer_free(&raw);
+
+  /* Stage 6: if formatter changed the document, reload the LineBuf */
+  if (pr.formatted && formatted_text) {
+    Pos saved_cursor = e->cursor;
+    editor_reload_from_bytes(e, gc, formatted_text, formatted_len);
+    free(formatted_text);
+    /* Restore cursor (clamp to new content) */
+    e->cursor = saved_cursor;
+    editor_clamp_cursor(e);
+    editor_update_gutter(e, gc);
+    /* Dirty all xcaches */
+    int n = editor_line_count(e);
+    for (int i = 0; i < n; i++) {
+      Line *l = editor_line(e, i);
+      if (l)
+        l->xcache_dirty = true;
+    }
+  } else {
+    free(formatted_text);
+  }
+
+  /* Report result */
+  switch (pr.status) {
+  case PIPE_OK:
+  case PIPE_OK_FORMAT_UNCHANGED:
+  case PIPE_OK_FORMAT_SKIPPED: {
+    e->dirty = false;
+    e->journal_pending = false;
+    /* Show language + formatter info in status */
+    const char *fmt_cmd = fmt_command_name(e->lang);
+    char msg[512];
+    if (pr.formatted) {
+      snprintf(msg, sizeof(msg), "Saved + formatted with %s",
+               fmt_cmd ? fmt_cmd : "formatter");
+    } else if (pr.status == PIPE_OK_FORMAT_SKIPPED ||
+               pr.status == PIPE_OK_FORMAT_UNCHANGED) {
+      snprintf(msg, sizeof(msg), "Saved [%s]  %s", lang_name(e->lang),
+               pr.status == PIPE_OK_FORMAT_SKIPPED ? ""
+                                                   : "(no format changes)");
+    } else {
+      snprintf(msg, sizeof(msg), "Saved [%s]", lang_name(e->lang));
+    }
+    editor_set_status(e, msg);
+    return true;
+  }
+  case PIPE_OK_FORMAT_FAILED: {
+    e->dirty = false;
+    e->journal_pending = false;
+    char msg[768];
+    snprintf(msg, sizeof(msg), "Saved (formatter error: %.240s)", pr.diag);
+    editor_set_status(e, msg);
+    return true;
+  }
+  case PIPE_ERR_VALIDATE:
+  case PIPE_ERR_STORAGE: {
+    char msg[768];
+    snprintf(msg, sizeof(msg), "Save failed: %.240s", pr.diag);
     editor_set_status(e, msg);
     return false;
   }
-  e->dirty = false;
-  e->journal_pending = false;
-  char msg[1024];
-  snprintf(msg, sizeof(msg), "Saved: %.1000s", e->filename);
-  editor_set_status(e, msg);
-  return true;
+  }
+  return false;
 }
 
 static bool editor_do_load(Editor *e, GlyphCache *gc, const char *path) {
@@ -1907,6 +1986,15 @@ static bool editor_do_load(Editor *e, GlyphCache *gc, const char *path) {
   uring_init(&e->uring);
   bytebuffer_free(&e->rec_doc);
   e->rec_available = false;
+
+  /* Language detection: extension + content heuristic */
+  {
+    ByteBuffer content_buf;
+    editor_serialize(e, &content_buf);
+    e->lang =
+        lang_detect(path, (const char *)content_buf.data, content_buf.len);
+    bytebuffer_free(&content_buf);
+  }
   if (res == STORAGE_OPEN_RECOVERED) {
     ByteBuffer rd;
     StorageMetadata rm;
@@ -2248,15 +2336,16 @@ static void render_status_bar(SDL_Renderer *ren, GlyphCache *gc, Editor *e,
     render_str(gc, e->status_msg, &mx, ty, 100, 220, 120);
   }
 
-  /* Right: line/col + search count */
-  char right[128];
+  /* Right: language + line/col + search count */
+  char right[192];
+  const char *lname = lang_name(e->lang);
   if (e->search_active && e->mode == MODE_FIND) {
-    snprintf(right, sizeof(right), "[%d/%d]  Ln %d  Col %d  ",
-             e->search_current + 1, e->search_count, e->cursor.row + 1,
+    snprintf(right, sizeof(right), "[%d/%d]  %s  Ln %d  Col %d  ",
+             e->search_current + 1, e->search_count, lname, e->cursor.row + 1,
              e->cursor.col + 1);
   } else {
-    snprintf(right, sizeof(right), "Ln %d  Col %d  ", e->cursor.row + 1,
-             e->cursor.col + 1);
+    snprintf(right, sizeof(right), "%s  Ln %d  Col %d  ", lname,
+             e->cursor.row + 1, e->cursor.col + 1);
   }
   int rw = measure_string(gc, right, (int)strlen(right));
   int rx = ww - rw - 8;
@@ -2775,6 +2864,11 @@ static bool handle_overlay_keydown(Editor *e, GlyphCache *gc, SDL_Window *win,
     if (e->mode == MODE_SAVE_PROMPT) {
       if (e->prompt[0]) {
         snprintf(e->filename, sizeof(e->filename), "%s", e->prompt);
+        /* Re-detect language if extension changed */
+        ByteBuffer cb;
+        editor_serialize(e, &cb);
+        e->lang = lang_detect(e->filename, (const char *)cb.data, cb.len);
+        bytebuffer_free(&cb);
         e->mode = e->mode_pre_overlay;
         editor_do_save(e, gc);
       }
@@ -2954,6 +3048,7 @@ static void handle_keydown(Editor *e, GlyphCache *gc, SDL_Window *win,
     e->dirty = false;
     uring_destroy(&e->uring);
     uring_init(&e->uring);
+    e->lang = lang_detect(DEFAULT_FILENAME, NULL, 0);
     editor_update_gutter(e, gc);
     editor_set_status(e, "New file");
     return;
@@ -3072,6 +3167,7 @@ int main(int argc, char *argv[]) {
   if (!editor_do_load(&editor, &gc, target)) {
     /* New file — leave the empty line in place */
     snprintf(editor.filename, sizeof(editor.filename), "%s", target);
+    editor.lang = lang_detect(target, NULL, 0);
     /* Open storage session for new file anyway (creates journal etc.) */
     StorageSession *ses = NULL;
     ByteBuffer dummy;
@@ -3192,6 +3288,9 @@ int main(int argc, char *argv[]) {
     if (editor.storage) {
       ByteBuffer asav;
       editor_serialize(&editor, &asav);
+      /* Autosave goes through a lightweight pipeline path:
+         skip formatting (too slow for background) but use the same
+         storage_autosave_tick debounce. */
       bool fired =
           storage_autosave_tick(editor.storage, &asav, &editor.doc_meta, now);
       bytebuffer_free(&asav);

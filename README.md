@@ -39,14 +39,23 @@ falls back to DejaVu Sans Mono at the system font path.
 ## Project layout
 
 ```
-editor/
+text-editor/
 ├── Makefile
+├── README.md
+├── assets/
+│   └── font.ttf                  ← monospace font (required)
 ├── include/
-│   └── storage.h          # persistence layer API
+│   ├── storage.h                 ← persistence layer API
+│   ├── language.h                ← LanguageRegistry API
+│   ├── formatter.h               ← FormattingEngine API
+│   └── save_pipeline.h           ← SavePipeline API
 └── src/
-    ├── storage.c           # EDOC format, atomic save, journal, autosave
-    ├── editor.c            # everything else
-    └── test_storage.c      # 34 storage-layer tests
+    ├── editor.c                  ← rendering, input, editor core
+    ├── storage.c                 ← EDOC format, atomic save, journal, autosave, backups
+    ├── language.c                ← language detection (extension, shebang, content)
+    ├── formatter.c               ← external formatter runner
+    ├── save_pipeline.c           ← 6-stage pre-write pipeline
+    └── test_storage.c            ← 34 storage layer tests
 ```
 
 ---
@@ -75,6 +84,48 @@ not a full document clone. Multi-line operations (paste, selection
 delete, replace-all) push `OP_SNAPSHOT` (serialised flat text). Pushing
 a new op truncates the redo tail; redo is always available until a new
 edit is made.
+
+### Language detection
+
+On every open and save, the file is passed through a three-stage detector:
+
+1. **Extension** — `.c`, `.rs`, `.go`, `.py`, `.ts`, `.jsx`, `.tsx`, `.json`, `.yaml`, `.toml`, `.md`, and more.
+2. **Shebang** — `#!/usr/bin/env python3`, `#!/bin/bash`, etc.
+3. **Content heuristics** — C++ markers (`namespace`, `std::`), Rust (`fn main`, `impl`), Go (`package` + `func`), Python (`def:`), JSON structural detection.
+
+`.h` files are re-examined by content to distinguish C from C++.
+
+### Formatting pipeline
+
+Every save (keyboard, autosave, programmatic) passes through a 6-stage pipeline before any bytes reach disk:
+
+| Stage | Description |
+|-------|-------------|
+| 1 | Validate internal document state |
+| 2 | Run language-aware external formatter |
+| 3 | Signal syntax cache invalidation |
+| 4 | Collect diagnostics |
+| 5 | Persist to disk atomically |
+| 6 | Reload LineBuf if formatter changed the text |
+
+Formatting **never blocks a save** — if the formatter is absent or fails, the save proceeds with the original text and a diagnostic is shown.
+
+Registered formatters:
+
+| Language | Formatter |
+|----------|-----------|
+| C / C++ | `clang-format` |
+| Rust | `rustfmt` |
+| Go | `gofmt` |
+| Python | `ruff format` (falls back to `black`) |
+| JS / TS / JSX / TSX | `prettier` |
+| JSON / YAML / Markdown / CSS / HTML | `prettier` |
+| Shell | `shfmt` |
+| Lua | `stylua` |
+| Zig | `zig fmt` |
+| Kotlin | `ktfmt` |
+
+Adding a new formatter is a single line in `FORMATTER_RULES[]` in `formatter.c`.
 
 ### Storage layer
 
@@ -135,8 +186,8 @@ it. Five rotating numbered backups are maintained automatically.
 |-----|--------|
 | Type | Insert text |
 | `Enter` | New line, preserve indentation |
-| `Backspace` | Delete char left (+ `Ctrl` → delete word) |
-| `Delete` | Delete char right (+ `Ctrl` → delete word) |
+| `Backspace` | Delete char left (`Ctrl` → delete word) |
+| `Delete` | Delete char right (`Ctrl` → delete word) |
 | `Tab` | Insert 4 spaces |
 | `Shift + Tab` | Unindent current line |
 | `Tab` with selection | Indent selected lines |
@@ -162,7 +213,7 @@ it. Five rotating numbered backups are maintained automatically.
 |-----|--------|
 | `Ctrl + N` | New file |
 | `Ctrl + O` | Open file (path prompt) |
-| `Ctrl + S` | Save (filename prompt) |
+| `Ctrl + S` | Save + format (filename prompt) |
 
 ### Search
 
@@ -177,13 +228,12 @@ it. Five rotating numbered backups are maintained automatically.
 | Key | Action |
 |-----|--------|
 | `Ctrl + P` | Open palette |
-| Type | Filter commands |
+| Type | Filter commands (case-insensitive) |
 | `Up / Down` | Navigate |
 | `Enter` | Execute |
 | `Esc` | Close |
 
-Built-in palette commands: Save, Open, Find, Find & Replace, Go to
-Line, Toggle Line Comment, Duplicate Line.
+Built-in palette commands: Save, Open, Find, Find & Replace, Go to Line, Toggle Line Comment, Duplicate Line.
 
 ---
 
@@ -207,11 +257,12 @@ On disk next to `yourfile.edoc`:
 ## Status bar
 
 ```
-INSERT  path/to/file.edoc [+]      Saved: file.edoc      [3/12]  Ln 42  Col 7
-│       │                  │        │                      │        │
-mode    filename           dirty    status message         search   position
+INSERT  path/to/file.c [+]    Saved + formatted with clang-format    C  Ln 42  Col 7
+│       │               │      │                                       │  │
+mode    filename        dirty  status message                          language  position
 ```
 
 `[+]` appears when there are unsaved changes.
 `[n/N]` appears during an active search (current match / total matches).
 `~ autosaved` flashes top-right after a background save.
+Language name (e.g. `C`, `Rust`, `Python`) appears right of position.

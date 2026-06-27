@@ -5,21 +5,28 @@ SANITIZE ?=
 OPT ?= -O2 -g
 
 SDL_CFLAGS := $(shell pkg-config --cflags sdl2)
-SDL_LIBS := $(shell pkg-config --libs sdl2)
-FT_CFLAGS := $(shell pkg-config --cflags freetype2)
-FT_LIBS := $(shell pkg-config --libs freetype2)
+SDL_LIBS   := $(shell pkg-config --libs sdl2)
+FT_CFLAGS  := $(shell pkg-config --cflags freetype2)
+FT_LIBS    := $(shell pkg-config --libs freetype2)
 
 INCLUDE := -Iinclude
-CFLAGS := $(CSTD) $(WARN) $(OPT) $(INCLUDE) $(SDL_CFLAGS) $(FT_CFLAGS) $(SANITIZE)
+CFLAGS  := $(CSTD) $(WARN) $(OPT) $(INCLUDE) $(SDL_CFLAGS) $(FT_CFLAGS) $(SANITIZE)
 LDFLAGS := $(SDL_LIBS) $(FT_LIBS) -lm $(SANITIZE)
 
 BUILD_DIR := build
-SRC_DIR := src
+SRC_DIR   := src
 
-EDITOR_BIN := $(BUILD_DIR)/editor
+EDITOR_BIN       := $(BUILD_DIR)/editor
 TEST_STORAGE_BIN := $(BUILD_DIR)/test_storage
 
-EDITOR_SRCS := $(SRC_DIR)/storage.c $(SRC_DIR)/editor.c
+# Editor sources (all .c files except the test harness)
+EDITOR_SRCS := \
+	$(SRC_DIR)/storage.c      \
+	$(SRC_DIR)/language.c     \
+	$(SRC_DIR)/formatter.c    \
+	$(SRC_DIR)/save_pipeline.c \
+	$(SRC_DIR)/editor.c
+
 EDITOR_OBJS := $(EDITOR_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 TEST_STORAGE_SRCS := $(SRC_DIR)/storage.c $(SRC_DIR)/test_storage.c
