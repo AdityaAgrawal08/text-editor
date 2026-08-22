@@ -3,6 +3,7 @@
 
 #include "storage.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -608,8 +609,14 @@ static StorageStatus journal_find_last_valid(const uint8_t *data, size_t len,
   size_t cursor = len;
   while (cursor >= 8) {
     uint64_t rec_len = read_u64_le(data + cursor - 8);
-    if (rec_len == 0 || rec_len > cursor - 8)
-      break; /* corrupt trailer, stop scanning backward from here */
+    if (rec_len == 0 || rec_len > cursor - 8) {
+      /* Torn/garbage trailer (e.g. crash mid-append left a partial
+         trailing length). Step back one byte and keep scanning instead
+         of abandoning the search: earlier complete records may still be
+         recoverable. */
+      cursor--;
+      continue;
+    }
 
     size_t rec_start = cursor - 8 - rec_len;
     /* validate matching leading length prefix exists and matches */
@@ -700,6 +707,64 @@ static void rotate_backups(const char *path) {
 }
 
 /* ===================================================================== *
+ * Orphaned temp files
+ * ===================================================================== */
+
+/* A crash between open(tmp) and rename() leaves "<path>.tmp.<pid>.<salt>"
+   behind. On session open, remove leftovers from OTHER pids that are at
+   least an hour old (never touch a concurrent editor's in-flight tmp). */
+static void sweep_stale_tmp_files(const char *path) {
+  char dir[STORAGE_PATH_MAX];
+  snprintf(dir, sizeof(dir), "%s", path);
+  char *slash = strrchr(dir, '/');
+  const char *base = path;
+  if (slash) {
+    *slash = '\0';
+    base = slash + 1;
+  } else {
+    snprintf(dir, sizeof(dir), "%s", ".");
+  }
+
+  size_t base_len = strlen(base);
+  if (base_len == 0 || base_len >= sizeof(((struct dirent *)0)->d_name))
+    return;
+
+  DIR *d = opendir(dir);
+  if (!d)
+    return;
+
+  pid_t self = getpid();
+  time_t now = time(NULL);
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strncmp(de->d_name, base, base_len) != 0)
+      continue;
+    const char *tail = de->d_name + base_len;
+    if (strncmp(tail, ".tmp.", 5) != 0)
+      continue;
+    int pid;
+    unsigned salt;
+    if (sscanf(tail, ".tmp.%d.%x", &pid, &salt) != 2)
+      continue;
+    if ((pid_t)pid == self)
+      continue;
+
+    char full[STORAGE_PATH_MAX];
+    int n = snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+    if (n < 0 || (size_t)n >= sizeof(full))
+      continue;
+
+    struct stat st;
+    if (stat(full, &st) != 0 || !S_ISREG(st.st_mode))
+      continue;
+    if (now - st.st_mtime < 3600)
+      continue;
+    unlink(full);
+  }
+  closedir(d);
+}
+
+/* ===================================================================== *
  * Session lifecycle
  * ===================================================================== */
 
@@ -731,6 +796,7 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
                       sizeof(s->journal_path));
   derive_sibling_path(path, ".autosave", s->autosave_path,
                       sizeof(s->autosave_path));
+  sweep_stale_tmp_files(path);
   s->autosave_interval_ms = STORAGE_DEFAULT_AUTOSAVE_MS;
   s->dirty = false;
   s->has_recovery_candidate = false;
@@ -908,11 +974,34 @@ StorageStatus storage_save(StorageSession *session, const char *path,
   if (st != STORAGE_OK)
     return st;
 
+  bool rebind = (strcmp(path, session->path) != 0);
+  if (rebind) {
+    /* Clear the journal bound to the OLD path first, so a stale
+       non-empty journal doesn't trigger a spurious recovery prompt the
+       next time the old file is opened. */
+    storage_journal_clear(session);
+    snprintf(session->path, sizeof(session->path), "%s", path);
+    derive_sibling_path(path, ".journal", session->journal_path,
+                        sizeof(session->journal_path));
+    derive_sibling_path(path, ".autosave", session->autosave_path,
+                        sizeof(session->autosave_path));
+  }
+
   storage_journal_clear(session);
 
   session->dirty = false;
-  snprintf(session->path, sizeof(session->path), "%s", path);
   return STORAGE_OK;
+}
+
+/* Reopen the journal fd if it died (e.g. storage_journal_clear's reopen
+   failed once). Self-heals instead of silently killing all future
+   journaling for the session. */
+static StorageStatus journal_ensure_fd(StorageSession *session) {
+  if (session->journal_fd >= 0)
+    return STORAGE_OK;
+  session->journal_fd =
+      open(session->journal_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+  return session->journal_fd >= 0 ? STORAGE_OK : STORAGE_ERR_IO;
 }
 
 StorageStatus storage_journal_append(StorageSession *session,
@@ -920,7 +1009,7 @@ StorageStatus storage_journal_append(StorageSession *session,
                                      const ByteBuffer *document) {
   if (!session || !op_description || !document)
     return STORAGE_ERR_INVALID_ARG;
-  if (session->journal_fd < 0)
+  if (journal_ensure_fd(session) != STORAGE_OK)
     return STORAGE_ERR_IO;
   StorageStatus st =
       journal_append_record(session->journal_fd, op_description, document);
@@ -942,15 +1031,21 @@ StorageStatus storage_journal_clear(StorageSession *session) {
   return STORAGE_OK;
 }
 
-bool storage_autosave_tick(StorageSession *session, const ByteBuffer *document,
-                           const StorageMetadata *meta, uint32_t now_ms) {
-  if (!session || !document || !meta)
-    return false;
-  if (!session->dirty)
+bool storage_should_autosave(const StorageSession *session, uint32_t now_ms) {
+  if (!session || !session->dirty)
     return false;
   if (session->has_attempted_autosave &&
-      (now_ms - session->last_autosave_attempt_ms) <
+      (uint32_t)(now_ms - session->last_autosave_attempt_ms) <
           session->autosave_interval_ms)
+    return false;
+  return true;
+}
+
+bool storage_autosave_tick(StorageSession *session, const ByteBuffer *document,
+                           const StorageMetadata *meta, uint32_t now_ms) {
+  if (!document || !meta)
+    return false;
+  if (!storage_should_autosave(session, now_ms))
     return false;
 
   session->has_attempted_autosave = true;
@@ -981,6 +1076,14 @@ bool storage_autosave_tick(StorageSession *session, const ByteBuffer *document,
 void storage_set_autosave_interval(StorageSession *session, uint32_t ms) {
   if (session)
     session->autosave_interval_ms = ms;
+}
+
+bool storage_autosave_path(const StorageSession *session, char *out_path,
+                           size_t out_path_size) {
+  if (!session || !out_path || out_path_size == 0)
+    return false;
+  int n = snprintf(out_path, out_path_size, "%s", session->autosave_path);
+  return n > 0 && (size_t)n < out_path_size;
 }
 
 void storage_mark_dirty(StorageSession *session) {

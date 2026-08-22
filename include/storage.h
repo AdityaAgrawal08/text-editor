@@ -195,9 +195,19 @@ StorageStatus storage_journal_clear(StorageSession *session);
 bool storage_autosave_tick(StorageSession *session, const ByteBuffer *document,
                            const StorageMetadata *meta, uint32_t now_ms);
 
+/* Pure predicate: would an autosave fire on this tick? Lets callers skip
+ * expensive document serialization when no write can happen anyway.
+ * Has no side effects. */
+bool storage_should_autosave(const StorageSession *session, uint32_t now_ms);
+
 void storage_set_autosave_interval(StorageSession *session, uint32_t ms);
 void storage_mark_dirty(StorageSession *session);
 bool storage_is_dirty(const StorageSession *session);
+
+/* Copies this session's autosave sibling path into out_path. Returns
+   false if out_path_size was too small or arguments were invalid. */
+bool storage_autosave_path(const StorageSession *session, char *out_path,
+                           size_t out_path_size);
 
 /* ---- Recovery --------------------------------------------------------- */
 
