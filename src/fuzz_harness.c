@@ -28,7 +28,7 @@
 
 StorageStatus fuzz_parse_edoc(const uint8_t *data, size_t len);
 StorageStatus fuzz_journal_scan(const uint8_t *data, size_t len);
-StorageStatus fuzz_history_parse(const uint8_t *data, size_t len);
+StorageStatus fuzz_history_parse(const uint8_t *data, size_t len, size_t *out_count);
 
 #define MAX_INPUT (64u * 1024u)
 #define SEED_PATH "/tmp/palimpsest_fuzz_seed.edoc"
@@ -325,7 +325,7 @@ static void run_target(unsigned t, const uint8_t *data, size_t len, Hist *h) {
     st = fuzz_journal_scan(data, len);
     break;
   case T_HISTORY:
-    st = fuzz_history_parse(data, len);
+    st = fuzz_history_parse(data, len, NULL);
     break;
   }
   if (st >= 0 && (size_t)st < HIST_SIZE)
@@ -341,7 +341,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   memcpy(copy, data, size);
   fuzz_parse_edoc(copy, size);
   fuzz_journal_scan(copy, size);
-  fuzz_history_parse(copy, size);
+  fuzz_history_parse(copy, size, NULL);
   return 0;
 }
 

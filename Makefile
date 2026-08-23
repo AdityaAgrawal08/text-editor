@@ -60,7 +60,8 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CSTD) $(WARN) -g -O0 $(INCLUDE) $(SANITIZE) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) -g -O0 $(INCLUDE) $(SANITIZE) $(DEPFLAGS) \
+		-DSTORAGE_FUZZING -c $< -o $@
 
 $(BUILD_DIR)/fuzz_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CSTD) $(WARN) -g -O1 $(INCLUDE) $(SANITIZE) $(DEPFLAGS) \
