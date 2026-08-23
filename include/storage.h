@@ -103,6 +103,7 @@ typedef enum {
   STORAGE_SECTION_DOCUMENT = 1,
   STORAGE_SECTION_METADATA = 2,
   STORAGE_SECTION_JOURNAL = 3,
+  STORAGE_SECTION_VERSIONS = 4,
 } StorageSectionType;
 
 /* Opaque growable byte buffer used for section payloads. Callers
@@ -120,6 +121,19 @@ bool bytebuffer_append(ByteBuffer *b, const void *data, size_t len);
 bool bytebuffer_append_u32(ByteBuffer *b, uint32_t v);
 bool bytebuffer_append_u64(ByteBuffer *b, uint64_t v);
 void bytebuffer_free(ByteBuffer *b);
+
+/* One named, immutable snapshot of the document embedded in the file
+   itself (git-like local history: every explicit save records one).
+   `name` defaults to "v<N>" (N = id) and is user-renamable. */
+#define STORAGE_VERSION_NAME_MAX 64
+#define STORAGE_VERSION_REC_MAGIC 0x31524556u /* "VER1" little-endian */
+
+typedef struct {
+  uint64_t id;         /* monotonic per-file version number */
+  uint64_t created_at; /* unix epoch seconds */
+  char name[STORAGE_VERSION_NAME_MAX];
+  ByteBuffer doc; /* full document snapshot */
+} StorageVersion;
 
 /* Document metadata persisted alongside the body. Kept separate from the
    document body so future schema changes to the body don't require
@@ -208,6 +222,27 @@ bool storage_is_dirty(const StorageSession *session);
    false if out_path_size was too small or arguments were invalid. */
 bool storage_autosave_path(const StorageSession *session, char *out_path,
                            size_t out_path_size);
+
+/* ---- Version history (embedded in the file) ------------------------- */
+
+/* Number of stored versions. */
+size_t storage_history_count(const StorageSession *session);
+
+/* Version at public index i (0 = NEWEST, count-1 = oldest), or NULL. */
+const StorageVersion *storage_history_at(const StorageSession *session,
+                                         size_t index);
+
+/* Rename the version at public index i. Marks history dirty; the new
+   name is persisted on the next successful save. */
+bool storage_history_rename(StorageSession *session, size_t index,
+                            const char *name);
+
+/* Delete the version at public index i (irreversible even before save —
+   the in-memory record is dropped). Marks history dirty. */
+bool storage_history_delete(StorageSession *session, size_t index);
+
+/* True when renames/deletes are pending persistence. */
+bool storage_history_dirty(const StorageSession *session);
 
 /* ---- Recovery --------------------------------------------------------- */
 
