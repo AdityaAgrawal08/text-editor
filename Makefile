@@ -10,8 +10,11 @@ FT_CFLAGS  := $(shell pkg-config --cflags freetype2)
 FT_LIBS    := $(shell pkg-config --libs freetype2)
 
 INCLUDE := -Iinclude
-CFLAGS  := $(CSTD) $(WARN) $(OPT) $(INCLUDE) $(SDL_CFLAGS) $(FT_CFLAGS) $(SANITIZE)
-LDFLAGS := $(SDL_LIBS) $(FT_LIBS) -lm $(SANITIZE)
+DEPFLAGS := -MMD -MP
+# Recursively expanded so target-specific overrides (debug/test) reach the
+# recipes; immediate (:=) expansion here is what silently disabled sanitizers.
+CFLAGS  = $(CSTD) $(WARN) $(OPT) $(INCLUDE) $(SDL_CFLAGS) $(FT_CFLAGS) $(SANITIZE)
+LDFLAGS = $(SDL_LIBS) $(FT_LIBS) -lm $(SANITIZE)
 
 BUILD_DIR := build
 SRC_DIR   := src
@@ -40,10 +43,10 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CSTD) $(WARN) -g -O0 $(INCLUDE) $(SANITIZE) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) -g -O0 $(INCLUDE) $(SANITIZE) $(DEPFLAGS) -c $< -o $@
 
 $(EDITOR_BIN): $(EDITOR_OBJS) | $(BUILD_DIR)
 	$(CC) $(EDITOR_OBJS) -o $@ $(LDFLAGS)
@@ -64,3 +67,6 @@ run: $(EDITOR_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+DEPS := $(EDITOR_OBJS:.o=.d) $(TEST_STORAGE_OBJS:.o=.d)
+-include $(DEPS)
