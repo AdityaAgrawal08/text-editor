@@ -21,6 +21,7 @@ SRC_DIR   := src
 
 EDITOR_BIN       := $(BUILD_DIR)/editor
 TEST_STORAGE_BIN := $(BUILD_DIR)/test_storage
+FUZZ_BIN         := $(BUILD_DIR)/fuzz_harness
 
 # Editor sources (all .c files except the test harness)
 EDITOR_SRCS := \
@@ -35,7 +36,20 @@ EDITOR_OBJS := $(EDITOR_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 TEST_STORAGE_SRCS := $(SRC_DIR)/storage.c $(SRC_DIR)/test_storage.c
 TEST_STORAGE_OBJS := $(TEST_STORAGE_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/test_%.o)
 
-.PHONY: all clean test run debug
+# Fuzz harness: storage.c compiled with the -DSTORAGE_FUZZING shim
+FUZZ_SRCS := $(SRC_DIR)/storage.c $(SRC_DIR)/fuzz_harness.c
+FUZZ_OBJS := $(FUZZ_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/fuzz_%.o)
+
+# libFuzzer variant (clang only): coverage-guided, same shim + entry macro
+LF_CFLAGS := $(CSTD) $(WARN) -g -O1 $(INCLUDE) -DSTORAGE_FUZZING -DLIBFUZZER \
+             -fsanitize=fuzzer-no-link,fuzzer
+LF_OBJS   := $(BUILD_DIR)/lf_storage.o $(BUILD_DIR)/lf_fuzz_harness.o
+
+ifneq (,$(findstring clang,$(CC)))
+LF_ENABLED := 1
+endif
+
+.PHONY: all clean test run debug fuzz fuzz-libfuzzer
 
 all: $(EDITOR_BIN)
 
@@ -47,6 +61,36 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CSTD) $(WARN) -g -O0 $(INCLUDE) $(SANITIZE) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fuzz_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CSTD) $(WARN) -g -O1 $(INCLUDE) $(SANITIZE) $(DEPFLAGS) \
+		-DSTORAGE_FUZZING -c $< -o $@
+
+$(FUZZ_BIN): $(FUZZ_OBJS) | $(BUILD_DIR)
+	$(CC) $(CSTD) $(WARN) -g -O1 $(SANITIZE) $(FUZZ_OBJS) -o $@ -lm
+
+# N and SEED are overridable: make fuzz N=5000000 SEED=7
+N ?= 1000000
+SEED ?= 42
+fuzz: SANITIZE := -fsanitize=address,undefined
+fuzz: $(FUZZ_BIN)
+	./$(FUZZ_BIN) all $(N) $(SEED)
+
+# Coverage-guided variant; requires clang (-fsanitize=fuzzer is clang-only).
+ifneq (,$(findstring clang,$(CC)))
+.PHONY: fuzz-libfuzzer
+fuzz-libfuzzer: $(BUILD_DIR)/fuzz_libfuzzer
+
+$(BUILD_DIR)/fuzz_libfuzzer: $(LF_OBJS)
+	$(CC) $(LF_CFLAGS) $(LF_OBJS) -o $@
+
+$(BUILD_DIR)/lf_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(LF_CFLAGS) $(DEPFLAGS) -c $< -o $@
+else
+.PHONY: fuzz-libfuzzer
+fuzz-libfuzzer:
+	$(error fuzz-libfuzzer requires clang: run 'make fuzz-libfuzzer CC=clang')
+endif
 
 $(EDITOR_BIN): $(EDITOR_OBJS) | $(BUILD_DIR)
 	$(CC) $(EDITOR_OBJS) -o $@ $(LDFLAGS)
@@ -68,5 +112,6 @@ run: $(EDITOR_BIN)
 clean:
 	rm -rf $(BUILD_DIR)
 
-DEPS := $(EDITOR_OBJS:.o=.d) $(TEST_STORAGE_OBJS:.o=.d)
+DEPS := $(EDITOR_OBJS:.o=.d) $(TEST_STORAGE_OBJS:.o=.d) \
+        $(FUZZ_OBJS:.o=.d) $(LF_OBJS:.o=.d)
 -include $(DEPS)

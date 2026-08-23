@@ -492,16 +492,20 @@ static StorageStatus parse_edoc_image(const uint8_t *data, size_t len,
   size_t end = len - 8; /* exclude footer */
 
   for (uint32_t i = 0; i < section_count; i++) {
-    if (off + SECTION_HEADER_SIZE > end)
+    if (off + SECTION_HEADER_SIZE > end) {
+      bytebuffer_free(out_document);
       return STORAGE_ERR_TRUNCATED;
+    }
 
     uint32_t type = read_u32_le(data + off);
     uint64_t payload_len = read_u64_le(data + off + 4);
     uint32_t payload_crc = read_u32_le(data + off + 12);
     off += SECTION_HEADER_SIZE;
 
-    if (off + payload_len > end)
+    if (off + payload_len > end) {
+      bytebuffer_free(out_document);
       return STORAGE_ERR_TRUNCATED;
+    }
 
     uint32_t computed_crc = crc32_compute(data + off, (size_t)payload_len);
     if (computed_crc != payload_crc) {
@@ -1469,3 +1473,46 @@ const char *storage_status_string(StorageStatus status) {
   }
   return "unknown error";
 }
+
+/* ===================================================================== *
+ * Fuzz-harness entry points (compiled out unless -DSTORAGE_FUZZING).
+ * Each wrapper owns full cleanup so a harness can call it millions of
+ * times with arbitrary bytes; behavior is identical to production paths.
+ * ===================================================================== */
+#ifdef STORAGE_FUZZING
+
+StorageStatus fuzz_parse_edoc(const uint8_t *data, size_t len) {
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageVersion *hist = NULL;
+  size_t hist_len = 0;
+  StorageStatus st =
+      parse_edoc_image(data, len, &doc, &meta, &hist, &hist_len);
+  /* Ownership contract of parse_edoc_image: on STORAGE_OK the document
+   * buffer is live and ours; on any failure it was freed internally.
+   * History, however, is ALWAYS caller-owned whenever the pointer was
+   * set — including failure paths that abort mid-section-loop. */
+  if (st == STORAGE_OK)
+    bytebuffer_free(&doc);
+  history_free(hist, hist_len);
+  return st;
+}
+
+StorageStatus fuzz_journal_scan(const uint8_t *data, size_t len) {
+  ByteBuffer doc;
+  bytebuffer_init(&doc);
+  StorageStatus st = journal_find_last_valid(data, len, &doc);
+  if (st == STORAGE_OK)
+    bytebuffer_free(&doc);
+  return st;
+}
+
+StorageStatus fuzz_history_parse(const uint8_t *data, size_t len) {
+  StorageVersion *hist = NULL;
+  size_t hist_len = 0;
+  parse_history_section(data, len, &hist, &hist_len);
+  history_free(hist, hist_len);
+  return STORAGE_OK;
+}
+
+#endif /* STORAGE_FUZZING */
