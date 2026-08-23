@@ -2073,7 +2073,7 @@ static bool editor_do_save(Editor *e, GlyphCache *gc) {
                                             &loaded_meta, &open_res);
     if (st != STORAGE_OK) {
       char msg[512];
-      snprintf(msg, sizeof(msg), "Cannot save '%s': %s", e->filename,
+      snprintf(msg, sizeof(msg), "Cannot save '%.400s': %s", e->filename,
                storage_status_string(st));
       editor_set_status(e, msg);
       return false;
@@ -2205,7 +2205,7 @@ static bool editor_do_load(Editor *e, GlyphCache *gc, const char *path) {
   StorageStatus st = storage_session_open(path, &ses, &doc, &meta, &res);
   if (st != STORAGE_OK) {
     char msg[512];
-    snprintf(msg, sizeof(msg), "Cannot open '%s': %s", path,
+    snprintf(msg, sizeof(msg), "Cannot open '%.400s': %s", path,
              storage_status_string(st));
     editor_set_status(e, msg);
     return false;

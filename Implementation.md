@@ -59,8 +59,11 @@ close window → quit prompt appears.
 
 > Implemented-and-verified locally (W0): header-touch rebuild = exactly the 3 objects
 > including storage.h; `make debug` shows `-O0 -g … -fsanitize=address,undefined` on
-> compile AND link lines; gcc + clang both build clean with `-Wall -Wextra -Werror`;
-> `make test` = 0 failures. CI-on-push and the three manual GUI checks remain for owner.
+> compile AND link lines; gcc + clang both build clean with `-Wall -Wextra -Werror`
+> **and `-D_FORTIFY_SOURCE=2`** (Ubuntu/CI toolchains enable fortify by default —
+> this caught a `-Wformat-truncation` in editor_do_save's error path; fixed with
+> `%.400s` caps in save/load diagnostics); `make test` = 0 failures. CI-on-push and
+> the three manual GUI checks remain for owner.
 
 ---
 
