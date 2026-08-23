@@ -144,6 +144,24 @@ in-progress state between autosaves (debounced to 800 ms). On open,
 the editor checks for a newer journal or autosave and offers to restore
 it. Five rotating numbered backups are maintained automatically.
 
+### Version history — git-like saves inside the file
+
+Every explicit `Ctrl+S` embeds an immutable snapshot of the document as
+a `VERSIONS` **section inside the `.edoc` file itself** — no sidecar
+files, nothing in your directory. Behaviour:
+
+| Aspect | Behaviour |
+|--------|-----------|
+| Auto-names | `v1`, `v2`, … shown as `v12 · 2026-08-23 14:05 · size` |
+| Duplicate saves | Deduped — byte-identical to the newest snapshot records nothing |
+| Retention | Unlimited (history lives inside the file) |
+| Rename / delete | In-browser; persisted on next save |
+| Restore | Loads into the buffer as an *unsaved* edit — review it, then `Ctrl+S` commits it as a new version. Undoable via `Ctrl+Z`. |
+
+Open the browser with `Ctrl+Alt+V`. Old `.edoc` files without a
+`VERSIONS` section open normally and start accumulating history from
+their first new save.
+
 ---
 
 ## Keyboard reference
@@ -234,6 +252,17 @@ it. Five rotating numbered backups are maintained automatically.
 | `Esc` | Close |
 
 Built-in palette commands: Save, Open, Find, Find & Replace, Go to Line, Toggle Line Comment, Duplicate Line.
+
+### Version history browser
+
+| Key | Action |
+|-----|--------|
+| `Ctrl + Alt + V` | Open version history |
+| `Up / Down`, `PgUp / PgDn` | Navigate (newest first) |
+| `Enter` | Restore version into buffer (unsaved, undoable) |
+| `R` | Rename version |
+| `D`, then `Enter` | Delete version (`Esc` cancels) |
+| `Esc` | Cancel / close |
 
 ---
 

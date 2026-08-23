@@ -22,6 +22,18 @@ static int g_failures = 0;
     }                                                                          \
   } while (0)
 
+static long fsize_or_neg(const char *p) {
+  struct stat st;
+  return stat(p, &st) == 0 ? (long)st.st_size : -1L;
+}
+
+/* Size of "<path><suffix>", or -1 when absent. */
+static long sibling_size(const char *path, const char *suffix) {
+  char buf[4096];
+  snprintf(buf, sizeof(buf), "%s%s", path, suffix);
+  return fsize_or_neg(buf);
+}
+
 static void make_doc(ByteBuffer *b, const char *text) {
   bytebuffer_init(b);
   bytebuffer_append(b, text, strlen(text));
@@ -436,6 +448,362 @@ static void test_backup_rotation(void) {
   cleanup_path(path);
 }
 
+/* ===================================================================== *
+ * Version history (embedded, git-like)
+ * ===================================================================== */
+
+static void test_history_accumulate_and_dedupe(void) {
+  const char *path = "/tmp/edoc_test_history.edoc";
+  cleanup_path(path);
+
+  StorageSession *session = NULL;
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &session, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+
+  CHECK(storage_history_count(session) == 0, "fresh file has no versions");
+
+  ByteBuffer v1, v2;
+  make_doc(&v1, "first version of the text");
+  storage_save(session, path, &v1, &meta);
+  CHECK(storage_history_count(session) == 1, "explicit save creates version");
+  CHECK(strcmp(storage_history_at(session, 0)->name, "v1") == 0,
+        "auto-name is v<id> (newest first)");
+
+  make_doc(&v2, "second version, changed text");
+  storage_save(session, path, &v2, &meta);
+  CHECK(storage_history_count(session) == 2, "second save adds a version");
+  CHECK(storage_history_at(session, 0)->id >
+            storage_history_at(session, 1)->id,
+        "ids are monotonic; index 0 is newest");
+
+  /* Duplicate save: byte-identical to newest -> no new record. */
+  storage_save(session, path, &v2, &meta);
+  CHECK(storage_history_count(session) == 2,
+        "identical consecutive save dedupes");
+
+  /* Round-trip through reopen. */
+  storage_session_close(session);
+  StorageSession *s2 = NULL;
+  StorageOpenResult res2;
+  storage_session_open(path, &s2, &doc, &meta, &res2);
+  CHECK(res2 == STORAGE_OPEN_CLEAN, "reopen with history stays CLEAN");
+  CHECK(storage_history_count(s2) == 2, "versions survive reopen");
+  const StorageVersion *newest = storage_history_at(s2, 0);
+  CHECK(newest->doc.len == v2.len &&
+            memcmp(newest->doc.data, v2.data, v2.len) == 0,
+        "newest snapshot byte-equal to saved document");
+  const StorageVersion *oldest = storage_history_at(s2, 1);
+  CHECK(oldest->doc.len == v1.len &&
+            memcmp(oldest->doc.data, v1.data, v1.len) == 0,
+        "oldest snapshot intact");
+
+  bytebuffer_free(&doc);
+  bytebuffer_free(&v1);
+  bytebuffer_free(&v2);
+  storage_session_close(s2);
+  cleanup_path(path);
+}
+
+static void test_history_rename_delete(void) {
+  const char *path = "/tmp/edoc_test_histedit.edoc";
+  cleanup_path(path);
+
+  StorageSession *session = NULL;
+  ByteBuffer doc, c1, c2, c3;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &session, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&c1, "alpha");
+  make_doc(&c2, "beta");
+  make_doc(&c3, "gamma");
+  storage_save(session, path, &c1, &meta);
+  storage_save(session, path, &c2, &meta);
+  storage_save(session, path, &c3, &meta);
+
+  /* Rename middle-of-newest-order: public idx 1 = "beta" version. */
+  CHECK(storage_history_at(session, 1)->doc.len == c2.len,
+        "public index 1 holds the middle version before rename");
+  CHECK(!storage_history_dirty(session), "history clean before rename");
+  CHECK(storage_history_rename(session, 1, "the-beta-release"),
+        "rename succeeds");
+  CHECK(storage_history_dirty(session), "rename marks history dirty");
+
+  /* Delete oldest (public idx 2). */
+  CHECK(storage_history_delete(session, 2), "delete oldest succeeds");
+  CHECK(storage_history_count(session) == 2, "count reflects deletion");
+
+  /* Persist + reopen. */
+  storage_save(session, path, &c3, &meta); /* identical -> no new version */
+  storage_session_close(session);
+
+  StorageSession *s2 = NULL;
+  StorageOpenResult res2;
+  storage_session_open(path, &s2, &doc, &meta, &res2);
+  CHECK(storage_history_count(s2) == 2, "deleted version stays gone");
+  CHECK(strcmp(storage_history_at(s2, 1)->name, "the-beta-release") == 0,
+        "renamed version persists across reopen");
+  CHECK(!storage_history_dirty(s2), "history dirty flag cleared by save");
+
+  bytebuffer_free(&doc);
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+  bytebuffer_free(&c3);
+  storage_session_close(s2);
+  cleanup_path(path);
+}
+
+static void test_history_corrupt_record_skipped(void) {
+  const char *path = "/tmp/edoc_test_histcorrupt.edoc";
+  cleanup_path(path);
+
+  StorageSession *session = NULL;
+  ByteBuffer doc, c1, c2;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &session, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&c1, "version one content");
+  make_doc(&c2, "version two content");
+  storage_save(session, path, &c1, &meta);
+  storage_save(session, path, &c2, &meta);
+  storage_session_close(session);
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+
+  /* Flip one byte inside the versions section payload. The section-level
+     CRC will reject the whole section (defensible), OR per-record
+     handling skips just the bad record — either way the file must still
+     OPEN and hand back the primary document. */
+  FILE *f = fopen(path, "r+b");
+  CHECK(f != NULL, "open file for corruption");
+  if (f) {
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    /* Versions section sits between metadata and footer: corrupt a byte
+       ~40% in, well past header/document/metadata for tiny docs. */
+    long pos = sz / 2;
+    fseek(f, pos, SEEK_SET);
+    int ch = fgetc(f);
+    fseek(f, pos, SEEK_SET);
+    fputc(ch ^ 0xFF, f);
+    fclose(f);
+  }
+
+  StorageSession *s2 = NULL;
+  StorageOpenResult res2;
+  StorageStatus st = storage_session_open(path, &s2, &doc, &meta, &res2);
+  CHECK(st == STORAGE_OK, "file with corrupted history still opens");
+  CHECK(res2 == STORAGE_OPEN_RECOVERED || res2 == STORAGE_OPEN_CLEAN,
+        "corruption reported as recoverable/clean, not fatal");
+  /* The primary file is checksum-fatal when hit, so the loader rescues
+     via the most recent backup — which holds the previous snapshot.
+     Either known text proves a valid document was recovered. */
+  bool got_v1 =
+      doc.len == strlen("version one content") &&
+      memcmp(doc.data, "version one content", doc.len) == 0;
+  bool got_v2 =
+      doc.len == strlen("version two content") &&
+      memcmp(doc.data, "version two content", doc.len) == 0;
+  CHECK(got_v1 || got_v2,
+        "a valid document snapshot survives history corruption");
+  bytebuffer_free(&doc);
+  storage_session_close(s2);
+  cleanup_path(path);
+}
+
+static void test_history_legacy_file_without_versions(void) {
+  const char *path = "/tmp/edoc_test_legacy.edoc";
+  cleanup_path(path);
+
+  /* Build a legacy image by saving with a session whose history we then
+     strip: simplest faithful legacy file = current writer minus the
+     versions section. Achieve it by writing via build_edoc_image's old
+     shape — emulate with an autosave-style save (NULL history) copied to
+     the main path. */
+  StorageSession *session = NULL;
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &session, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+
+  ByteBuffer content;
+  make_doc(&content, "legacy document body");
+  storage_mark_dirty(session); /* autosave only fires when dirty */
+  CHECK(storage_autosave_tick(session, &content, &meta, 1000),
+        "autosave (NULL history) written"); /* legacy-shaped file */
+  char autosave_path[4096];
+  snprintf(autosave_path, sizeof(autosave_path), "%s.autosave", path);
+  bytebuffer_free(&content);
+  storage_session_close(session);
+
+  /* Promote the autosave (no VERSIONS section) to the primary path. */
+  CHECK(rename(autosave_path, path) == 0, "legacy-shaped file promoted");
+
+  StorageSession *s2 = NULL;
+  StorageOpenResult res2;
+  storage_session_open(path, &s2, &doc, &meta, &res2);
+  CHECK(res2 == STORAGE_OPEN_CLEAN, "legacy file opens CLEAN");
+  CHECK(storage_history_count(s2) == 0, "legacy file reports zero versions");
+  CHECK(doc.len == strlen("legacy document body"),
+        "legacy document content loads");
+  bytebuffer_free(&doc);
+  storage_session_close(s2);
+  cleanup_path(path);
+}
+
+static void test_history_stress_many_saves(void) {
+  const char *path = "/tmp/edoc_test_histstress.edoc";
+  cleanup_path(path);
+
+  StorageSession *session = NULL;
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &session, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+
+  enum { N = 40 };
+  for (int i = 0; i < N; i++) {
+    ByteBuffer c;
+    char text[64];
+    snprintf(text, sizeof(text), "stress revision %d", i);
+    make_doc(&c, text);
+    CHECK(storage_save(session, path, &c, &meta) == STORAGE_OK,
+          "stress save succeeds");
+    bytebuffer_free(&c);
+  }
+  CHECK(storage_history_count(session) == N, "unlimited retention keeps all");
+
+  storage_session_close(session);
+  StorageSession *s2 = NULL;
+  StorageOpenResult res2;
+  storage_session_open(path, &s2, &doc, &meta, &res2);
+  CHECK(storage_history_count(s2) == N, "all versions round-trip");
+  CHECK(strcmp(storage_history_at(s2, 0)->name, "v40") == 0,
+        "newest auto-name matches id sequence");
+  CHECK(strcmp(storage_history_at(s2, N - 1)->name, "v1") == 0,
+        "oldest is v1");
+  bytebuffer_free(&doc);
+  storage_session_close(s2);
+  cleanup_path(path);
+}
+
+/* Save-As must move journal+autosave binding to the new path. */
+static void test_save_as_rebinds_siblings(void) {
+  const char *A = "/tmp/edoc_test_sa_a.edoc";
+  const char *B = "/tmp/edoc_test_sa_b.edoc";
+  char buf[4096];
+  cleanup_path(A);
+  cleanup_path(B);
+
+  StorageSession *s = NULL;
+  ByteBuffer doc, content;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(A, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+
+  make_doc(&content, "v1");
+  storage_save(s, A, &content, &meta);
+  CHECK(sibling_size(A, ".journal") == 0, "A journal clean after save");
+
+  CHECK(storage_save(s, B, &content, &meta) == STORAGE_OK, "save-as to B");
+
+  ByteBuffer edit;
+  make_doc(&edit, "v2-changed");
+  CHECK(storage_journal_append(s, "edit", &edit) == STORAGE_OK,
+        "journal after save-as");
+  bytebuffer_free(&edit);
+  CHECK(sibling_size(B, ".journal") > 0, "B journal received record");
+  CHECK(sibling_size(A, ".journal") == 0, "A journal untouched");
+
+  CHECK(storage_should_autosave(s, 1000), "dirty -> autosave due");
+  storage_autosave_tick(s, &content, &meta, 1000);
+  CHECK(sibling_size(B, ".autosave") > 0, "autosave next to B");
+  CHECK(sibling_size(A, ".autosave") < 0, "no autosave next to A");
+  bytebuffer_free(&content);
+
+  /* Fresh open of B surfaces journaled state as recovery */
+  StorageSession *s2 = NULL;
+  ByteBuffer d;
+  StorageOpenResult r2;
+  make_doc(&content, "v2-changed");
+  storage_journal_append(s, "edit", &content);
+  bytebuffer_free(&content);
+  storage_session_open(B, &s2, &d, &meta, &r2);
+  CHECK(r2 == STORAGE_OPEN_RECOVERED, "reopen B reports RECOVERED");
+  ByteBuffer rd;
+  StorageMetadata rm;
+  CHECK(storage_recovery_get(s2, &rd, &rm) == STORAGE_OK &&
+            rd.len == 10 && memcmp(rd.data, "v2-changed", 10) == 0,
+        "recovered snapshot matches journal");
+  bytebuffer_free(&rd);
+  bytebuffer_free(&d);
+  storage_recovery_discard(s2);
+  storage_session_close(s2);
+  storage_session_close(s);
+  cleanup_path(A);
+  cleanup_path(B);
+}
+
+/* End-to-end flow mirroring the editor: save, dedupe, edit-save,
+   browser rename+delete, persisting dedupe-save, reopen, restore bytes. */
+static void test_version_browser_flow(void) {
+  const char *path = "/tmp/edoc_test_vflow.edoc";
+  cleanup_path(path);
+
+  StorageSession *s = NULL;
+  ByteBuffer doc, c1, c2;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+
+  make_doc(&c1, "int main() {\n    return 0;\n}");
+  storage_save(s, path, &c1, &meta);
+  CHECK(storage_history_count(s) == 1 &&
+            strcmp(storage_history_at(s, 0)->name, "v1") == 0,
+        "first Ctrl+S records v1");
+
+  storage_save(s, path, &c1, &meta); /* identical */
+  CHECK(storage_history_count(s) == 1, "identical save deduped");
+
+  make_doc(&c2, "int main(void) {\n    return 0;\n}");
+  storage_save(s, path, &c2, &meta);
+  CHECK(storage_history_count(s) == 2, "changed save records v2");
+
+  CHECK(storage_history_rename(s, 0, "before-void"), "rename v2");
+  CHECK(storage_history_delete(s, 1), "delete v1");
+  storage_save(s, path, &c2, &meta); /* dedupe save persists mutations */
+  CHECK(!storage_history_dirty(s), "history persisted via dedupe save");
+  CHECK(storage_history_count(s) == 1, "only renamed version remains");
+
+  storage_session_close(s);
+  StorageSession *s2 = NULL;
+  StorageOpenResult r2;
+  storage_session_open(path, &s2, &doc, &meta, &r2);
+  CHECK(r2 == STORAGE_OPEN_CLEAN, "clean reopen after browser edits");
+  CHECK(storage_history_count(s2) == 1 &&
+            strcmp(storage_history_at(s2, 0)->name, "before-void") == 0,
+        "renamed-only history round-trips");
+  const StorageVersion *v = storage_history_at(s2, 0);
+  CHECK(v->doc.len == c2.len && memcmp(v->doc.data, c2.data, c2.len) == 0,
+        "restore bytes match edited document");
+  CHECK(storage_verify_file(path) == STORAGE_OK,
+        "file integrity after all mutations");
+
+  bytebuffer_free(&doc);
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+  storage_session_close(s2);
+  cleanup_path(path);
+}
+
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -445,6 +813,13 @@ int main(void) {
   test_journal_torn_write_recovery();
   test_autosave_debounce();
   test_backup_rotation();
+  test_history_accumulate_and_dedupe();
+  test_history_rename_delete();
+  test_history_corrupt_record_skipped();
+  test_history_legacy_file_without_versions();
+  test_history_stress_many_saves();
+  test_save_as_rebinds_siblings();
+  test_version_browser_flow();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

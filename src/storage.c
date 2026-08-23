@@ -142,15 +142,23 @@ struct StorageSession {
   uint32_t autosave_interval_ms;
   uint32_t last_autosave_attempt_ms;
   bool has_attempted_autosave; /* false until the first tick; guards against
-                                   the now_ms==0 edge case where a zero-
-                                   initialized last_autosave_attempt_ms would
-                                   otherwise make (now_ms - last) appear to
-                                   be within the debounce window even though
-                                   no autosave has ever actually run */
+                                    the now_ms==0 edge case where a zero-
+                                    initialized last_autosave_attempt_ms would
+                                    otherwise make (now_ms - last) appear to
+                                    be within the debounce window even though
+                                    no autosave has ever actually run */
   bool has_recovery_candidate;
   ByteBuffer recovery_document;
   StorageMetadata recovery_meta;
   int journal_fd; /* kept open, append-only, for low-latency journaling */
+
+  /* Embedded version history (oldest-first in memory; public accessors
+     reverse the order so index 0 = newest). */
+  StorageVersion *hist;
+  size_t hist_len;
+  size_t hist_cap;
+  uint64_t hist_next_id;
+  bool hist_dirty; /* renames/deletes awaiting persistence */
 };
 
 /* ===================================================================== *
@@ -273,6 +281,15 @@ static StorageStatus read_whole_file(const char *path, ByteBuffer *out) {
  * EDOC serialization
  * ===================================================================== */
 
+/* History serde lives below the journal section; forward decls for the
+   image builder/parser above. */
+static void history_free(StorageVersion *hist, size_t len);
+static void serialize_history_section(const StorageVersion *hist, size_t len,
+                                      ByteBuffer *out);
+static StorageStatus parse_history_section(const uint8_t *data, size_t len,
+                                           StorageVersion **out_hist,
+                                           size_t *out_len);
+
 static void serialize_metadata(const StorageMetadata *meta, ByteBuffer *out) {
   bytebuffer_init(out);
   uint32_t title_len = (uint32_t)strnlen(meta->title, sizeof(meta->title));
@@ -331,10 +348,13 @@ static bool deserialize_metadata(const uint8_t *data, size_t len,
 }
 
 /* Builds a complete EDOC file image in memory: header + sections + footer.
+   `history` may be NULL (autosave files carry no version section).
    Caller owns and frees the returned ByteBuffer. */
 static StorageStatus build_edoc_image(const ByteBuffer *document,
                                       const StorageMetadata *meta,
                                       const ByteBuffer *journal_tail,
+                                      const StorageVersion *hist,
+                                      size_t hist_len,
                                       ByteBuffer *out_image) {
   bytebuffer_init(out_image);
 
@@ -402,6 +422,21 @@ static StorageStatus build_edoc_image(const ByteBuffer *document,
     section_count++;
   }
 
+  /* SECTION_VERSIONS (optional — embedded git-like history) */
+  if (hist && hist_len > 0) {
+    ByteBuffer hist_buf;
+    serialize_history_section(hist, hist_len, &hist_buf);
+    uint32_t crc = crc32_compute(hist_buf.data, hist_buf.len);
+    bool ok = bytebuffer_append_u32(out_image, STORAGE_SECTION_VERSIONS) &&
+              bytebuffer_append_u64(out_image, (uint64_t)hist_buf.len) &&
+              bytebuffer_append_u32(out_image, crc) &&
+              bytebuffer_append(out_image, hist_buf.data, hist_buf.len);
+    bytebuffer_free(&hist_buf);
+    if (!ok)
+      goto nomem;
+    section_count++;
+  }
+
   /* Footer: section_count + crc32 over everything written so far
      (header + all sections), giving whole-file tamper/corruption
      detection independent of the per-section checksums. */
@@ -419,10 +454,17 @@ nomem:
 }
 
 /* Parses a raw EDOC byte image already loaded into memory. Verifies every
-   checksum before returning anything. */
+   checksum before returning anything. out_history may be NULL (caller
+   doesn't want versions decoded, e.g. integrity verification). */
 static StorageStatus parse_edoc_image(const uint8_t *data, size_t len,
                                       ByteBuffer *out_document,
-                                      StorageMetadata *out_meta) {
+                                      StorageMetadata *out_meta,
+                                      StorageVersion **out_history,
+                                      size_t *out_history_len) {
+  if (out_history) {
+    *out_history = NULL;
+    *out_history_len = 0;
+  }
   if (len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE)
     return STORAGE_ERR_TRUNCATED;
 
@@ -479,6 +521,14 @@ static StorageStatus parse_edoc_image(const uint8_t *data, size_t len,
         return STORAGE_ERR_TRUNCATED;
       }
       got_metadata = true;
+    } else if (type == STORAGE_SECTION_VERSIONS && out_history &&
+               *out_history == NULL) {
+      StorageVersion *vh = NULL;
+      size_t vlen = 0;
+      parse_history_section(data + off, (size_t)payload_len, &vh, &vlen);
+      /* Empty/malformed section is fine; keep whatever decoded. */
+      *out_history = vh;
+      *out_history_len = vlen;
     }
     /* STORAGE_SECTION_JOURNAL and any unknown future section types are
        intentionally skipped here for forward compatibility: an older
@@ -667,6 +717,163 @@ static StorageStatus journal_find_last_valid(const uint8_t *data, size_t len,
 }
 
 /* ===================================================================== *
+ * Version history (embedded SECTION_VERSIONS)
+ *
+ * Section payload = records back-to-back. Each record:
+ *   u32 rec_magic ("VER1")
+ *   u64 id
+ *   u64 created_at
+ *   u32 name_len, name bytes (<= STORAGE_VERSION_NAME_MAX-1)
+ *   u64 doc_len, u32 doc_crc32, doc bytes
+ *   u32 rec_crc32 (over all preceding bytes of this record)
+ *
+ * The enclosing section already carries a payload CRC (verified before
+ * this parser runs) and saves are atomic tmp+rename, so records cannot be
+ * torn by crashes; the per-record CRC is defense-in-depth against crafted
+ * or foreign corruption. On any malformed record, parsing stops and the
+ * versions decoded so far are kept.
+ * ===================================================================== */
+
+static void history_free(StorageVersion *hist, size_t len) {
+  for (size_t i = 0; i < len; i++)
+    bytebuffer_free(&hist[i].doc);
+  free(hist);
+}
+
+static bool history_push(StorageSession *s, uint64_t id, uint64_t ts,
+                         const char *name, const uint8_t *doc, size_t doc_len) {
+  if (s->hist_len == s->hist_cap) {
+    size_t nc = s->hist_cap ? s->hist_cap * 2 : 8;
+    StorageVersion *nh = realloc(s->hist, nc * sizeof(StorageVersion));
+    if (!nh)
+      return false;
+    s->hist = nh;
+    s->hist_cap = nc;
+  }
+  StorageVersion *v = &s->hist[s->hist_len++];
+  memset(v, 0, sizeof(*v));
+  v->id = id;
+  v->created_at = ts;
+  snprintf(v->name, sizeof(v->name), "%s", name && name[0] ? name : "");
+  bytebuffer_init(&v->doc);
+  if (doc_len > 0) {
+    if (!bytebuffer_append(&v->doc, doc, doc_len)) {
+      s->hist_len--;
+      return false;
+    }
+  }
+  if (id >= s->hist_next_id)
+    s->hist_next_id = id + 1;
+  return true;
+}
+
+static void serialize_history_section(const StorageVersion *hist, size_t len,
+                                      ByteBuffer *out) {
+  bytebuffer_init(out);
+  for (size_t i = 0; i < len; i++) {
+    const StorageVersion *v = &hist[i];
+    ByteBuffer rec;
+    bytebuffer_init(&rec);
+
+    uint32_t name_len = (uint32_t)strnlen(v->name, sizeof(v->name));
+    bool ok = bytebuffer_append_u32(&rec, STORAGE_VERSION_REC_MAGIC) &&
+              bytebuffer_append_u64(&rec, v->id) &&
+              bytebuffer_append_u64(&rec, v->created_at) &&
+              bytebuffer_append_u32(&rec, name_len) &&
+              bytebuffer_append(&rec, v->name, name_len) &&
+              bytebuffer_append_u64(&rec, (uint64_t)v->doc.len) &&
+              bytebuffer_append_u32(&rec, crc32_compute(v->doc.data,
+                                                        v->doc.len)) &&
+              bytebuffer_append(&rec, v->doc.data, v->doc.len);
+    if (!ok) {
+      bytebuffer_free(&rec);
+      continue; /* OOM: drop this record rather than corrupt the section */
+    }
+
+    uint32_t crc = crc32_compute(rec.data, rec.len);
+    if (!bytebuffer_append_u32(&rec, crc)) {
+      bytebuffer_free(&rec);
+      continue;
+    }
+    if (!bytebuffer_append(out, rec.data, rec.len))
+      break; /* OOM on outer buffer: keep what we have */
+    bytebuffer_free(&rec);
+  }
+}
+
+/* Parses a VERSIONS section payload into a freshly-allocated array.
+   Returns STORAGE_OK even when individual records are malformed — those
+   are skipped — and only fails on out-of-memory. Caller frees via
+   history_free(). */
+static StorageStatus parse_history_section(const uint8_t *data, size_t len,
+                                           StorageVersion **out_hist,
+                                           size_t *out_len) {
+  *out_hist = NULL;
+  *out_len = 0;
+
+  /* Decode into a temporary session-less accumulator: reuse a scratch
+     session struct purely for its list fields. */
+  StorageSession scratch;
+  memset(&scratch, 0, sizeof(scratch));
+
+  size_t off = 0;
+  while (off + 4 <= len) {
+    uint32_t magic = read_u32_le(data + off);
+    if (magic != STORAGE_VERSION_REC_MAGIC)
+      break; /* unknown tail bytes: stop defensively */
+
+    if (off + 4 + 8 + 8 + 4 > len)
+      break;
+    uint64_t id = read_u64_le(data + off + 4);
+    uint64_t ts = read_u64_le(data + off + 12);
+    uint32_t name_len = read_u32_le(data + off + 20);
+    off += 24;
+
+    if (name_len >= STORAGE_VERSION_NAME_MAX || off + name_len > len)
+      break;
+    const char *name = (const char *)(data + off);
+    off += name_len;
+
+    if (off + 8 + 4 > len)
+      break;
+    uint64_t doc_len = read_u64_le(data + off);
+    off += 12; /* doc_len field (8) + stored per-record doc CRC (4); the
+                  record CRC below re-covers the whole body, so the
+                  standalone doc CRC is read implicitly via body check */
+
+    if (doc_len > SIZE_MAX - 1 || off + doc_len + 4 > len)
+      break;
+
+    const uint8_t *doc = data + off;
+    off += (size_t)doc_len;
+    if (off + 4 > len)
+      break;
+    uint32_t rec_crc = read_u32_le(data + off);
+    off += 4;
+
+    /* Per-record CRC over everything from magic through doc bytes. */
+    size_t body_len =
+        4 + 8 + 8 + 4 + name_len + 8 + 4 + (size_t)doc_len;
+    if (crc32_compute(data + off - 4 - body_len, body_len) != rec_crc)
+      continue; /* skip this record, try the next */
+
+    char name_buf[STORAGE_VERSION_NAME_MAX];
+    memcpy(name_buf, name, name_len);
+    name_buf[name_len] = '\0';
+    if (!history_push(&scratch, id, ts, name_buf, doc, (size_t)doc_len))
+      break; /* OOM */
+  }
+
+  if (scratch.hist_len == 0) {
+    free(scratch.hist);
+    return STORAGE_OK; /* empty section is valid */
+  }
+  *out_hist = scratch.hist;
+  *out_len = scratch.hist_len;
+  return STORAGE_OK;
+}
+
+/* ===================================================================== *
  * Backups
  * ===================================================================== */
 
@@ -770,12 +977,15 @@ static void sweep_stale_tmp_files(const char *path) {
 
 static StorageStatus try_load_edoc_file(const char *path,
                                         ByteBuffer *out_document,
-                                        StorageMetadata *out_meta) {
+                                        StorageMetadata *out_meta,
+                                        StorageVersion **out_history,
+                                        size_t *out_history_len) {
   ByteBuffer raw;
   StorageStatus st = read_whole_file(path, &raw);
   if (st != STORAGE_OK)
     return st;
-  st = parse_edoc_image(raw.data, raw.len, out_document, out_meta);
+  st = parse_edoc_image(raw.data, raw.len, out_document, out_meta, out_history,
+                        out_history_len);
   bytebuffer_free(&raw);
   return st;
 }
@@ -816,9 +1026,15 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
   bool loaded_primary = false;
 
   if (main_exists) {
-    primary_status = try_load_edoc_file(path, out_document, out_meta);
+    primary_status = try_load_edoc_file(path, out_document, out_meta,
+                                        &s->hist, &s->hist_len);
     if (primary_status == STORAGE_OK)
       loaded_primary = true;
+    else {
+      history_free(s->hist, s->hist_len);
+      s->hist = NULL;
+      s->hist_len = 0;
+    }
   }
 
   if (!loaded_primary) {
@@ -830,8 +1046,14 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
       struct stat bst;
       if (stat(bpath, &bst) != 0)
         continue;
-      if (try_load_edoc_file(bpath, out_document, out_meta) == STORAGE_OK)
+      if (try_load_edoc_file(bpath, out_document, out_meta, &s->hist,
+                             &s->hist_len) == STORAGE_OK)
         loaded_primary = true;
+      else {
+        history_free(s->hist, s->hist_len);
+        s->hist = NULL;
+        s->hist_len = 0;
+      }
     }
   }
 
@@ -840,9 +1062,13 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
        brand-new document. */
     struct stat ast;
     if (stat(s->autosave_path, &ast) == 0 &&
-        try_load_edoc_file(s->autosave_path, out_document, out_meta) ==
-            STORAGE_OK) {
+        try_load_edoc_file(s->autosave_path, out_document, out_meta, &s->hist,
+                           &s->hist_len) == STORAGE_OK) {
       loaded_primary = true;
+    } else {
+      history_free(s->hist, s->hist_len);
+      s->hist = NULL;
+      s->hist_len = 0;
     }
   }
 
@@ -852,6 +1078,7 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
     out_meta->created_at = (uint64_t)time(NULL);
     out_meta->modified_at = out_meta->created_at;
     out_meta->schema_version = 1;
+    s->hist_next_id = 1; /* human-friendly: first version is v1 */
     *out_open_result = STORAGE_OPEN_NEW;
     *session = s;
     return STORAGE_OK;
@@ -905,8 +1132,11 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
     if (autosave_newer) {
       ByteBuffer autosave_doc;
       StorageMetadata autosave_meta;
-      if (try_load_edoc_file(s->autosave_path, &autosave_doc, &autosave_meta) ==
-          STORAGE_OK) {
+      StorageVersion *av_hist = NULL;
+      size_t av_hist_len = 0;
+      if (try_load_edoc_file(s->autosave_path, &autosave_doc, &autosave_meta,
+                             &av_hist, &av_hist_len) == STORAGE_OK) {
+        history_free(av_hist, av_hist_len); /* autosave history not used */
         bool differs = (autosave_doc.len != out_document->len) ||
                        (autosave_doc.len > 0 &&
                         memcmp(autosave_doc.data, out_document->data,
@@ -931,6 +1161,11 @@ StorageStatus storage_session_open(const char *path, StorageSession **session,
     *out_open_result = STORAGE_OPEN_RECOVERED;
   }
 
+  /* Version ids are 1-based; a file with no embedded history starts at
+     v1, and any parsed history leaves next_id at max(id)+1 already. */
+  if (s->hist_next_id == 0)
+    s->hist_next_id = 1;
+
   *session = s;
   return STORAGE_OK;
 }
@@ -941,6 +1176,7 @@ void storage_session_close(StorageSession *session) {
   if (session->journal_fd >= 0)
     close(session->journal_fd);
   bytebuffer_free(&session->recovery_document);
+  history_free(session->hist, session->hist_len);
   free(session);
 }
 
@@ -959,8 +1195,24 @@ StorageStatus storage_save(StorageSession *session, const char *path,
   if (meta_copy.created_at == 0)
     meta_copy.created_at = meta_copy.modified_at;
 
+  /* Record this save as a version unless it is byte-identical to the
+     newest one already stored ("nothing to commit"). */
+  if (session->hist_len == 0 ||
+      session->hist[session->hist_len - 1].doc.len != document->len ||
+      (document->len > 0 &&
+       memcmp(session->hist[session->hist_len - 1].doc.data, document->data,
+              document->len) != 0)) {
+    char auto_name[STORAGE_VERSION_NAME_MAX];
+    snprintf(auto_name, sizeof(auto_name), "v%llu",
+             (unsigned long long)session->hist_next_id);
+    if (!history_push(session, session->hist_next_id, (uint64_t)time(NULL),
+                      auto_name, document->data, document->len))
+      return STORAGE_ERR_NOMEM;
+  }
+
   ByteBuffer image;
-  StorageStatus st = build_edoc_image(document, &meta_copy, NULL, &image);
+  StorageStatus st = build_edoc_image(document, &meta_copy, NULL, session->hist,
+                                      session->hist_len, &image);
   if (st != STORAGE_OK)
     return st;
 
@@ -990,6 +1242,7 @@ StorageStatus storage_save(StorageSession *session, const char *path,
   storage_journal_clear(session);
 
   session->dirty = false;
+  session->hist_dirty = false; /* renames/deletes persisted with this save */
   return STORAGE_OK;
 }
 
@@ -1057,7 +1310,10 @@ bool storage_autosave_tick(StorageSession *session, const ByteBuffer *document,
     meta_copy.created_at = meta_copy.modified_at;
 
   ByteBuffer image;
-  if (build_edoc_image(document, &meta_copy, NULL, &image) != STORAGE_OK)
+  /* Autosave files deliberately carry NO version section (NULL history):
+     they are crash-recovery artifacts, not history commits. */
+  if (build_edoc_image(document, &meta_copy, NULL, NULL, 0, &image) !=
+      STORAGE_OK)
     return false;
 
   StorageStatus st =
@@ -1135,11 +1391,55 @@ StorageStatus storage_verify_file(const char *path) {
 
   ByteBuffer doc;
   StorageMetadata meta;
-  st = parse_edoc_image(raw.data, raw.len, &doc, &meta);
+  st = parse_edoc_image(raw.data, raw.len, &doc, &meta, NULL, NULL);
   bytebuffer_free(&raw);
   if (st == STORAGE_OK)
     bytebuffer_free(&doc);
   return st;
+}
+
+/* ===================================================================== *
+ * Version history accessors
+ * ===================================================================== */
+
+size_t storage_history_count(const StorageSession *session) {
+  return session ? session->hist_len : 0;
+}
+
+const StorageVersion *storage_history_at(const StorageSession *session,
+                                         size_t index) {
+  if (!session || index >= session->hist_len)
+    return NULL;
+  /* Public order is newest-first; internal storage is oldest-first. */
+  return &session->hist[session->hist_len - 1 - index];
+}
+
+bool storage_history_rename(StorageSession *session, size_t index,
+                            const char *name) {
+  if (!session || !name || !name[0])
+    return false;
+  StorageVersion *v = (StorageVersion *)storage_history_at(session, index);
+  if (!v)
+    return false;
+  snprintf(v->name, sizeof(v->name), "%s", name);
+  session->hist_dirty = true;
+  return true;
+}
+
+bool storage_history_delete(StorageSession *session, size_t index) {
+  if (!session || index >= session->hist_len)
+    return false;
+  size_t internal = session->hist_len - 1 - index;
+  bytebuffer_free(&session->hist[internal].doc);
+  memmove(&session->hist[internal], &session->hist[internal + 1],
+          (session->hist_len - internal - 1) * sizeof(StorageVersion));
+  session->hist_len--;
+  session->hist_dirty = true;
+  return true;
+}
+
+bool storage_history_dirty(const StorageSession *session) {
+  return session ? session->hist_dirty : false;
 }
 
 const char *storage_status_string(StorageStatus status) {
