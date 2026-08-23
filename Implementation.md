@@ -70,19 +70,41 @@ close window → quit prompt appears.
 ## W1 — P4a: fuzzing the parsers (~1 week)
 
 ### Tasks
-- [ ] Portable dumb-fuzzer target in-tree: `src/fuzz_harness.c` + `make fuzz N=100000 SEED=…`
+- [x] Portable dumb-fuzzer target in-tree: `src/fuzz_harness.c` + `make fuzz N=100000 SEED=…`
       feeding random/mutated bytes into:
       `parse_edoc_image`, `journal_find_last_valid`, `parse_history_section`
-- [ ] Expose parsers to harness without changing behavior (compile-time shim, e.g.
-      `-DSTORAGE_FUZZING` guarded non-static wrappers inside storage.c)
-- [ ] Optional libFuzzer path auto-detected when clang present (`-fsanitize=fuzzer`)
-- [ ] Fix every finding; each gets a regression test in `src/test_storage.c`
-- [ ] Record exec counts + findings summary (goes into README in W5)
+      (`N`/`SEED` overridable; deterministic xorshift64* per-seed campaigns)
+- [x] Expose parsers to harness without changing behavior
+      (`-DSTORAGE_FUZZING` guarded wrappers inside storage.c; test build
+      enables the same shim so regressions hit parser internals directly)
+- [x] Optional libFuzzer path auto-detected when clang present:
+      `make fuzz-libfuzzer CC=clang` (-fsanitize=fuzzer; friendly error on gcc)
+- [x] Fix every finding; each gets a regression test in `src/test_storage.c`
+- [x] Record exec counts + findings summary (below; goes into README in W5)
 
-### Validation
+### Findings & fixes (all verified fixed)
+| ID | Severity | What | Found by |
+|----|----------|------|----------|
+| F1 | Medium | `parse_edoc_image` leaked the document buffer on two mid-section `TRUNCATED` returns — reachable by opening any crash-truncated `.edoc` | dumb fuzzer run #1 (LeakSanitizer) |
+| F2 | **Critical** | SEGV / OOB read: additive bounds checks (`off + doc_len + 4 > len`) wrap for attacker-chosen lengths → crafted VERSIONS record crashes editor on open | libFuzzer coverage guidance (48-byte artifact) |
+| F3 | Hardening | Same overflow class: wrapped `payload_len` in container section headers | proactive fix alongside F2 |
+| F4 | Hardening | Same class: wrapped `doc_len` in journal records | proactive fix alongside F2 |
+
+Fix approach: all three parsers now use subtraction-based bounds;
+record-CRC span tracked from `rec_start` (no reconstructed arithmetic).
+Suite initially caught my first fix attempt being over-tight (valid
+records stopped parsing) — that is exactly why regressions gate here.
+
+### Evidence
 ```
-make fuzz N=1000000 SEED=42     # exits 0, prints exec count + coverage-ish stats
-make test                        # suite green incl. new regression tests
+Campaigns (ASan+UBSan throughout):
+  dumb:    2.8M execs (seeds 42/7/1337/9001 ×700k) + 400k post-fix
+  libFuzzer: 297k pre-fix (crash found) · 8.1M guided post-fix
+           · 1036 new coverage units · 0 crashes after fixes
+Regression suite: 5 new tests (crasher bytes, valid-record guard,
+  truncation-leak, wrapped payload_len, wrapped journal doc_len)
+make test: 0 failures · gcc/clang -Werror + _FORTIFY_SOURCE=2 clean
+Commits: 4eeb7b7 (infra+F1) · f3bcfe5 (F2-F4+regressions) — branch W1
 ```
 
 ---
