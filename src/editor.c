@@ -1512,11 +1512,16 @@ static void sel_delete(Editor *e, GlyphCache *gc) {
     Line *fb = editor_line(e, b.row);
     int blen = line_len(fb);
     int tail = blen - b.col;
+    char *tmp = NULL;
+    if (tail > 0) {
+      tmp = malloc((size_t)tail);
+      if (!tmp)
+        return; /* abort before mutating: snapshot already pushed */
+    }
     /* Trim first line to a.col */
     line_truncate(fa, a.col);
     /* Append tail of last line onto first */
     if (tail > 0) {
-      char *tmp = malloc((size_t)tail);
       for (int i = 0; i < tail; i++)
         tmp[i] = line_at(fb, b.col + i);
       line_insert(fa, a.col, tmp, tail);
@@ -1536,12 +1541,15 @@ static void sel_delete(Editor *e, GlyphCache *gc) {
  * Core editing operations (record undo, mutate, advance cursor)
  * ===================================================================== */
 
-static void ed_insert_text(Editor *e, GlyphCache *gc, const char *text, int n);
+static void ed_insert_text(Editor *e, GlyphCache *gc, const char *text, int n,
+                           bool preserve_indent);
 static void ed_backspace(Editor *e, GlyphCache *gc, bool word);
 static void ed_delete_fwd(Editor *e, GlyphCache *gc, bool word);
 static void ed_newline(Editor *e, GlyphCache *gc);
+static void ed_newline_raw(Editor *e, GlyphCache *gc);
 
-static void ed_insert_text(Editor *e, GlyphCache *gc, const char *text, int n) {
+static void ed_insert_text(Editor *e, GlyphCache *gc, const char *text, int n,
+                           bool preserve_indent) {
   if (e->sel_active)
     sel_delete(e, gc);
   /* Split on embedded newlines */
@@ -1557,7 +1565,10 @@ static void ed_insert_text(Editor *e, GlyphCache *gc, const char *text, int n) {
         e->cursor = after;
       }
       if (i < n) {
-        ed_newline(e, gc);
+        if (preserve_indent)
+          ed_newline(e, gc);
+        else
+          ed_newline_raw(e, gc);
       }
       start = i + 1;
     }
@@ -1597,6 +1608,17 @@ static void ed_newline(Editor *e, GlyphCache *gc) {
   e->cursor = after;
   editor_update_gutter(e, gc);
   editor_mark_dirty(e);
+}
+
+/* Split at the cursor with no indentation handling; used by paste so
+   clipboard content lands byte-for-byte. */
+static void ed_newline_raw(Editor *e, GlyphCache *gc) {
+  (void)gc;
+  Pos at = e->cursor;
+  Pos after = {at.row + 1, 0};
+  editor_push_split(e, at, after, NULL, 0);
+  raw_split(e, at);
+  e->cursor = after;
 }
 
 static void ed_backspace(Editor *e, GlyphCache *gc, bool word) {
@@ -1781,16 +1803,29 @@ static void ed_duplicate_line(Editor *e, GlyphCache *gc) {
   editor_push_snapshot(e);
   Line *src = editor_line(e, e->cursor.row);
   int slen = line_len(src);
-  Line *nl = calloc(1, sizeof(Line));
-  line_init(nl);
+  char *tmp = NULL;
   if (slen > 0) {
-    char *tmp = malloc((size_t)slen);
+    tmp = malloc((size_t)slen);
+    if (!tmp)
+      return;
     for (int i = 0; i < slen; i++)
       tmp[i] = line_at(src, i);
-    line_insert(nl, 0, tmp, slen);
-    free(tmp);
   }
-  lb_insert_line(&e->lb, e->cursor.row + 1, nl);
+  Line *nl = calloc(1, sizeof(Line));
+  if (!nl || !line_init(nl)) {
+    free(tmp);
+    free(nl);
+    return;
+  }
+  bool copied = true;
+  if (slen > 0)
+    copied = line_insert(nl, 0, tmp, slen);
+  free(tmp);
+  if (!copied || !lb_insert_line(&e->lb, e->cursor.row + 1, nl)) {
+    line_free(nl);
+    free(nl);
+    return;
+  }
   e->cursor.row++;
   editor_update_gutter(e, gc);
   editor_mark_dirty(e);
@@ -1844,7 +1879,7 @@ static void ed_paste(Editor *e, GlyphCache *gc) {
   editor_push_snapshot(e);
   if (e->sel_active)
     sel_delete(e, gc);
-  ed_insert_text(e, gc, text, (int)strlen(text));
+  ed_insert_text(e, gc, text, (int)strlen(text), false);
   SDL_free(text);
 }
 
@@ -2030,8 +2065,21 @@ static bool editor_reload_from_bytes(Editor *e, GlyphCache *gc,
 
 static bool editor_do_save(Editor *e, GlyphCache *gc) {
   if (!e->storage) {
-    editor_set_status(e, "No storage session");
-    return false;
+    StorageSession *ses = NULL;
+    ByteBuffer loaded;
+    StorageMetadata loaded_meta;
+    StorageOpenResult open_res;
+    StorageStatus st = storage_session_open(e->filename, &ses, &loaded,
+                                            &loaded_meta, &open_res);
+    if (st != STORAGE_OK) {
+      char msg[512];
+      snprintf(msg, sizeof(msg), "Cannot save '%.400s': %s", e->filename,
+               storage_status_string(st));
+      editor_set_status(e, msg);
+      return false;
+    }
+    bytebuffer_free(&loaded);
+    e->storage = ses;
   }
 
   /* Flatten current buffer */
@@ -2070,6 +2118,7 @@ static bool editor_do_save(Editor *e, GlyphCache *gc) {
 
   /* Stage 6: if formatter changed the document, reload the LineBuf */
   if (pr.formatted && formatted_text) {
+    editor_push_snapshot(e);
     Pos saved_cursor = e->cursor;
     editor_reload_from_bytes(e, gc, formatted_text, formatted_len);
     free(formatted_text);
@@ -2077,6 +2126,7 @@ static bool editor_do_save(Editor *e, GlyphCache *gc) {
     e->cursor = saved_cursor;
     editor_clamp_cursor(e);
     editor_update_gutter(e, gc);
+    refresh_preferred_x(e, gc);
     /* Dirty all xcaches */
     int n = editor_line_count(e);
     for (int i = 0; i < n; i++) {
@@ -2155,7 +2205,7 @@ static bool editor_do_load(Editor *e, GlyphCache *gc, const char *path) {
   StorageStatus st = storage_session_open(path, &ses, &doc, &meta, &res);
   if (st != STORAGE_OK) {
     char msg[512];
-    snprintf(msg, sizeof(msg), "Cannot open '%s': %s", path,
+    snprintf(msg, sizeof(msg), "Cannot open '%.400s': %s", path,
              storage_status_string(st));
     editor_set_status(e, msg);
     return false;
@@ -3664,9 +3714,21 @@ static void handle_keydown(Editor *e, GlyphCache *gc, SDL_Window *win,
   }
 
   /* Ctrl shortcuts (both modes) */
-  if (ctrl && sym == SDLK_s) {
+  /* Save As must be checked before the plain-save test: Ctrl+Shift+S also
+     matches Ctrl+S. Plain save is direct when the file already has a real
+     name; the prompt is only needed to name a brand-new file. */
+  if (ctrl && shift && sym == SDLK_s) {
     e->mode_pre_overlay = e->mode;
     cmd_save(e);
+    return;
+  }
+  if (ctrl && sym == SDLK_s) {
+    if (strcmp(e->filename, DEFAULT_FILENAME) == 0) {
+      e->mode_pre_overlay = e->mode;
+      cmd_save(e);
+    } else {
+      editor_do_save(e, gc);
+    }
     return;
   }
   if (ctrl && sym == SDLK_o) {
@@ -3743,10 +3805,23 @@ static void handle_keydown(Editor *e, GlyphCache *gc, SDL_Window *win,
       editor_set_status(e, "New file failed: out of memory");
       return;
     }
+    if (e->storage) {
+      storage_session_close(e->storage);
+      e->storage = NULL;
+    }
+    memset(&e->doc_meta, 0, sizeof(e->doc_meta));
+    e->doc_meta.created_at = (uint64_t)time(NULL);
+    e->doc_meta.modified_at = e->doc_meta.created_at;
+    e->doc_meta.schema_version = 1;
     e->cursor = (Pos){0, 0};
     e->scroll_row = 0;
     snprintf(e->filename, sizeof(e->filename), "%s", DEFAULT_FILENAME);
     e->dirty = false;
+    e->journal_pending = false;
+    e->journal_error_shown = false;
+    e->last_journal_ms = SDL_GetTicks();
+    bytebuffer_free(&e->rec_doc);
+    e->rec_available = false;
     uring_destroy(&e->uring);
     uring_init(&e->uring);
     e->lang = lang_detect(DEFAULT_FILENAME, NULL, 0);
@@ -3783,7 +3858,7 @@ static void handle_keydown(Editor *e, GlyphCache *gc, SDL_Window *win,
     } else if (shift) {
       ed_indent_lines(e, gc, true);
     } else {
-      ed_insert_text(e, gc, "    ", 4);
+      ed_insert_text(e, gc, "    ", 4, true);
     }
     return;
   }
@@ -3902,7 +3977,8 @@ int main(int argc, char *argv[]) {
       if (ev.type == SDL_QUIT) {
         bool has_unsaved =
             editor.dirty ||
-            (editor.storage && storage_history_dirty(editor.storage));
+            (editor.storage && storage_history_dirty(editor.storage)) ||
+            editor.rec_available;
         if (editor.mode == MODE_QUIT_PROMPT || !has_unsaved) {
           /* Second close request, or nothing to lose: discard any
              crash-recovery sidecars so the next open is clean. */
@@ -3929,7 +4005,10 @@ int main(int argc, char *argv[]) {
         if (editor.mode == MODE_RECOVERY_PROMPT ||
             editor.mode == MODE_PALETTE || editor.mode == MODE_SAVE_PROMPT ||
             editor.mode == MODE_OPEN_PROMPT || editor.mode == MODE_FIND ||
-            editor.mode == MODE_REPLACE || editor.mode == MODE_GOTO_LINE)
+            editor.mode == MODE_REPLACE || editor.mode == MODE_GOTO_LINE ||
+            editor.mode == MODE_QUIT_PROMPT ||
+            editor.mode == MODE_VERSION_BROWSER ||
+            editor.mode == MODE_VERSION_RENAME)
           continue;
         int mx = ev.button.x, my = ev.button.y;
         int r = (my - FIRST_LINE_Y) / LINE_HEIGHT_PX + editor.scroll_row;
@@ -3980,7 +4059,8 @@ int main(int argc, char *argv[]) {
         if (in_overlay) {
           handle_overlay_textinput(&editor, &gc, win, ev.text.text);
         } else if (editor.mode == MODE_INSERT) {
-          ed_insert_text(&editor, &gc, ev.text.text, (int)strlen(ev.text.text));
+          ed_insert_text(&editor, &gc, ev.text.text,
+                         (int)strlen(ev.text.text), true);
           cursor_moved = true;
         }
         continue;

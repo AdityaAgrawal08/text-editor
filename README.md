@@ -1,5 +1,7 @@
 # editor
 
+[![ci](https://github.com/AdityaAgrawal08/text-editor/actions/workflows/ci.yml/badge.svg)](https://github.com/AdityaAgrawal08/text-editor/actions/workflows/ci.yml)
+
 A custom text editor written in C using SDL2 and FreeType.
 
 ## Building
@@ -23,6 +25,15 @@ make          # optimised build  →  build/editor
 make debug    # ASan + UBSan     →  build/editor
 make test     # storage tests    →  build/test_storage
 ```
+
+Header dependencies are tracked automatically (`-MMD -MP`): editing any
+header in `include/` rebuilds exactly the objects that include it.
+
+### Continuous integration
+
+Every push is built on GitHub Actions with both **gcc** and **clang**:
+a release build with `-Werror`, plus the storage test suite and a full
+editor build under **ASan + UBSan**.
 
 ### Run
 
@@ -231,7 +242,8 @@ their first new save.
 |-----|--------|
 | `Ctrl + N` | New file |
 | `Ctrl + O` | Open file (path prompt) |
-| `Ctrl + S` | Save + format (filename prompt) |
+| `Ctrl + S` | Save + format — instant for named files; path prompt only for new files |
+| `Ctrl + Shift + S` | Save as (path prompt) |
 
 ### Search
 

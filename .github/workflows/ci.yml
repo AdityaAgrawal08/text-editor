@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.cc }} / ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        mode: [release, sanitizers]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-dev libfreetype-dev
+
+      - name: Build with -Werror
+        if: matrix.mode == 'release'
+        run: make clean && make CC=${{ matrix.cc }} WARN="-Wall -Wextra -Werror"
+
+      - name: Run storage test suite under ASan+UBSan
+        if: matrix.mode == 'sanitizers'
+        run: make clean && make test CC=${{ matrix.cc }}
+
+      - name: Build editor binary under ASan+UBSan
+        if: matrix.mode == 'sanitizers'
+        run: make debug CC=${{ matrix.cc }} WARN="-Wall -Wextra"
