@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Fuzz-shim entry points (storage.c is compiled with -DSTORAGE_FUZZING
@@ -1186,6 +1188,130 @@ static void test_toolkit_recovery_report(void) {
   cleanup_path(path);
 }
 
+/* ===================================================================== *
+ * W2: edoc CLI end-to-end roundtrips (system()-driven; binary is built
+ * by the `test` target). Property: import(export(f)) and export(import)
+ * preserve bytes exactly, across empty / unicode / ~10 MB documents.
+ * ===================================================================== */
+
+static int run_cli(char *cmd, char *const args[]) {
+  pid_t pid = fork();
+  if (pid < 0)
+    return -1;
+  if (pid == 0) {
+    execv("./build/edoc", args); /* cmd unused: argv[0] carries it */
+    _exit(127);
+  }
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static bool files_equal(const char *a, const char *b) {
+  ByteBuffer ba, bb;
+  bool eq = false;
+  if (read_whole_file_public(a, &ba) == STORAGE_OK &&
+      read_whole_file_public(b, &bb) == STORAGE_OK) {
+    eq = ba.len == bb.len &&
+         (ba.len == 0 || memcmp(ba.data, bb.data, ba.len) == 0);
+  }
+  bytebuffer_free(&ba);
+  bytebuffer_free(&bb);
+  return eq;
+}
+
+static void write_text_file(const char *path, const void *data, size_t len) {
+  FILE *f = fopen(path, "wb");
+  CHECK(f != NULL, "cli roundtrip: can write source text");
+  if (!f)
+    return;
+  if (len)
+    fwrite(data, 1, len, f);
+  fclose(f);
+}
+
+static void test_cli_roundtrips(void) {
+  unlink("/tmp/edoc_cli_r1.edoc");
+  unlink("/tmp/edoc_cli_r2.edoc");
+  unlink("/tmp/edoc_cli_r3.edoc");
+
+  { /* plain ASCII */
+    write_text_file("/tmp/edoc_cli_a.txt", "hello container\n", 16);
+    char *i1[] = {"edoc", "import", "/tmp/edoc_cli_a.txt",
+                  "/tmp/edoc_cli_r1.edoc", NULL};
+    CHECK(run_cli(NULL, i1) == 0, "cli: import ascii exits 0");
+    char *e1[] = {"edoc", "export", "/tmp/edoc_cli_r1.edoc",
+                  "/tmp/edoc_cli_out.txt", NULL};
+    CHECK(run_cli(NULL, e1) == 0, "cli: export ascii exits 0");
+    CHECK(files_equal("/tmp/edoc_cli_a.txt", "/tmp/edoc_cli_out.txt"),
+          "cli: ascii roundtrip byte-equal");
+    char *v1[] = {"edoc", "verify", "/tmp/edoc_cli_r1.edoc", NULL};
+    CHECK(run_cli(NULL, v1) == 0, "cli: verify imported container exits 0");
+    unlink("/tmp/edoc_cli_a.txt");
+    unlink("/tmp/edoc_cli_out.txt");
+    cleanup_path("/tmp/edoc_cli_r1.edoc");
+  }
+
+  { /* unicode body incl. emoji + combining marks */
+    static const char uni[] = "héllo wörld ✓ 日本語 🎉\n\ttabbed\r\n";
+    write_text_file("/tmp/edoc_cli_u.txt", uni, sizeof(uni) - 1);
+    char *i2[] = {"edoc", "import", "/tmp/edoc_cli_u.txt",
+                  "/tmp/edoc_cli_r2.edoc", NULL};
+    char *e2[] = {"edoc", "export", "/tmp/edoc_cli_r2.edoc",
+                  "/tmp/edoc_cli_out2.txt", NULL};
+    CHECK(run_cli(NULL, i2) == 0 && run_cli(NULL, e2) == 0,
+          "cli: unicode import/export exit 0");
+    CHECK(files_equal("/tmp/edoc_cli_u.txt", "/tmp/edoc_cli_out2.txt"),
+          "cli: unicode roundtrip byte-equal");
+    unlink("/tmp/edoc_cli_u.txt");
+    unlink("/tmp/edoc_cli_out2.txt");
+    cleanup_path("/tmp/edoc_cli_r2.edoc");
+  }
+
+  { /* ~10 MB pseudo-random deterministic body */
+    enum { BIG = 10 * 1024 * 1024 };
+    char *big = malloc(BIG);
+    CHECK(big != NULL, "cli: alloc 10MB body");
+    if (big) {
+      uint32_t x = 0x12345678u;
+      for (int i = 0; i < BIG; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        big[i] = (char)(x & 0xFF);
+      }
+      write_text_file("/tmp/edoc_cli_big.txt", big, BIG);
+      free(big);
+      char *i3[] = {"edoc", "import", "/tmp/edoc_cli_big.txt",
+                    "/tmp/edoc_cli_r3.edoc", NULL};
+      char *e3[] = {"edoc", "export", "/tmp/edoc_cli_r3.edoc",
+                    "/tmp/edoc_cli_out3.txt", NULL};
+      int rc_i = run_cli(NULL, i3);
+      int rc_e = run_cli(NULL, e3);
+      CHECK(rc_i == 0 && rc_e == 0, "cli: 10MB import/export exit 0");
+      CHECK(files_equal("/tmp/edoc_cli_big.txt", "/tmp/edoc_cli_out3.txt"),
+            "cli: 10MB roundtrip byte-equal");
+      unlink("/tmp/edoc_cli_big.txt");
+      unlink("/tmp/edoc_cli_out3.txt");
+      cleanup_path("/tmp/edoc_cli_r3.edoc");
+    }
+  }
+
+  { /* import refuses to clobber without --force */
+    write_text_file("/tmp/edoc_cli_c.txt", "x", 1);
+    char *i4[] = {"edoc", "import", "/tmp/edoc_cli_c.txt",
+                  "/tmp/edoc_cli_c.edoc", NULL};
+    CHECK(run_cli(NULL, i4) == 0, "cli: initial import ok");
+    CHECK(run_cli(NULL, i4) == 3, "cli: re-import without --force fails");
+    char *i5[] = {"edoc",       "import", "/tmp/edoc_cli_c.txt",
+                  "--force", "/tmp/edoc_cli_c.edoc", NULL};
+    CHECK(run_cli(NULL, i5) == 0, "cli: re-import with --force ok");
+    unlink("/tmp/edoc_cli_c.txt");
+    cleanup_path("/tmp/edoc_cli_c.edoc");
+  }
+}
+
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -1206,6 +1332,7 @@ int main(void) {
   test_toolkit_inspect();
   test_toolkit_read_versions();
   test_toolkit_recovery_report();
+  test_cli_roundtrips();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

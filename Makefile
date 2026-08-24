@@ -107,7 +107,7 @@ $(TEST_STORAGE_BIN): $(TEST_STORAGE_OBJS) | $(BUILD_DIR)
 	$(CC) $(CSTD) $(WARN) -g -O0 $(SANITIZE) $(TEST_STORAGE_OBJS) -o $@ -lm $(SANITIZE)
 
 test: SANITIZE := -fsanitize=address,undefined
-test: $(TEST_STORAGE_BIN)
+test: $(TEST_STORAGE_BIN) $(EDOC_BIN)
 	./$(TEST_STORAGE_BIN)
 
 debug: SANITIZE := -fsanitize=address,undefined

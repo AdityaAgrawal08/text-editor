@@ -1565,6 +1565,23 @@ void storage_versions_free(StorageVersion *versions, size_t count) {
   history_free(versions, count);
 }
 
+StorageStatus storage_read_document(const char *path, ByteBuffer *out_doc) {
+  if (!path || !out_doc)
+    return STORAGE_ERR_INVALID_ARG;
+  bytebuffer_init(out_doc);
+
+  ByteBuffer raw;
+  StorageMetadata meta;
+  StorageStatus st = read_whole_file(path, &raw);
+  if (st != STORAGE_OK)
+    return st;
+  st = parse_edoc_image(raw.data, raw.len, out_doc, &meta, NULL, NULL);
+  bytebuffer_free(&raw);
+  if (st != STORAGE_OK)
+    bytebuffer_free(out_doc); /* parser owns cleanup only on its paths */
+  return st;
+}
+
 StorageStatus storage_recovery_report(const char *path,
                                       StorageRecoveryReport *out_report) {
   if (!path || !out_report)

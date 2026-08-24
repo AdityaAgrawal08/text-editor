@@ -322,6 +322,10 @@ StorageStatus storage_read_versions(const char *path,
                                     size_t *out_count);
 void storage_versions_free(StorageVersion *versions, size_t count);
 
+/* Reads the current document body (SECTION_DOCUMENT payload) without
+ * opening a session. Caller frees via bytebuffer_free(). */
+StorageStatus storage_read_document(const char *path, ByteBuffer *out_doc);
+
 /* Non-destructive crash-recovery report for `path`. Populated from the
  * `.journal` sibling (latest valid record, if any) and `.autosave`
  * freshness versus the main file. Never modifies anything. */
