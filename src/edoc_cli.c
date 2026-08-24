@@ -316,6 +316,40 @@ static int cmd_import(int argc, char **argv) {
   return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* recover (report-only by design: applying recovery is an editor act) */
+/* ------------------------------------------------------------------ */
+static int cmd_recover(int argc, char **argv) {
+  if (argc != 1)
+    return usage();
+  StorageRecoveryReport rep;
+  StorageStatus st = storage_recovery_report(argv[0], &rep);
+  if (st != STORAGE_OK) {
+    fprintf(stderr, "%s: %s\n", argv[0], storage_status_string(st));
+    return 3;
+  }
+
+  bool anything = false;
+  if (rep.journal_candidate) {
+    anything = true;
+    printf("journal   : pending snapshot, %llu bytes\n",
+           (unsigned long long)rep.journal_doc.len);
+  } else {
+    printf("journal   : clean\n");
+  }
+  if (rep.autosave_exists) {
+    anything = true;
+    printf("autosave  : present%s\n",
+           rep.autosave_newer_than_main ? " (NEWER than main file)"
+                                        : "");
+  } else {
+    printf("autosave  : none\n");
+  }
+  if (!anything)
+    printf("%s: no recovery state\n", argv[0]);
+  return 0; /* a report is a success even when it reports damage */
+}
+
 int main(int argc, char **argv) {
   g_prog = (argc > 0 && argv[0]) ? argv[0] : "edoc";
   {
@@ -338,6 +372,8 @@ int main(int argc, char **argv) {
     return cmd_export(argc - 2, argv + 2);
   if (strcmp(cmd, "import") == 0)
     return cmd_import(argc - 2, argv + 2);
+  if (strcmp(cmd, "recover") == 0)
+    return cmd_recover(argc - 2, argv + 2);
 
   fprintf(stderr, "%s: unknown command '%s'\n", g_prog, cmd);
   return usage();
