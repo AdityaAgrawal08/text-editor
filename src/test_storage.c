@@ -706,7 +706,6 @@ static void test_history_stress_many_saves(void) {
 static void test_save_as_rebinds_siblings(void) {
   const char *A = "/tmp/edoc_test_sa_a.edoc";
   const char *B = "/tmp/edoc_test_sa_b.edoc";
-  char buf[4096];
   cleanup_path(A);
   cleanup_path(B);
 
@@ -1495,6 +1494,232 @@ static void test_cli_adversarial(void) {
   }
 }
 
+/* ===================================================================== *
+ * W2 consistency matrix: legacy-file behaviors, per-version export
+ * fidelity, selector edge cases, verify exit-code map, hostile-name
+ * imports, and the introspection summary contract on early errors.
+ * ===================================================================== */
+
+/* Builds a legacy-shaped container (no VERSIONS section) by promoting
+   an autosave image, mirroring pre-history files found in the wild. */
+static bool make_legacy_container(const char *path) {
+  char asp[512];
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  if (storage_session_open(path, &s, &doc, &meta, &res) != STORAGE_OK)
+    return false;
+  bytebuffer_free(&doc);
+  make_doc(&doc, "legacy body without history");
+  storage_mark_dirty(s);
+  bool ok = storage_autosave_tick(s, &doc, &meta, 1000);
+  storage_session_close(s);
+  bytebuffer_free(&doc);
+  snprintf(asp, sizeof(asp), "%s.autosave", path);
+  return ok && rename(asp, path) == 0;
+}
+
+static void test_consistency_matrix(void) {
+  /* --- legacy container across every relevant command --------------- */
+  const char *legacy = "/tmp/mx_legacy.edoc";
+  CHECK(make_legacy_container(legacy), "mx: legacy container created");
+  {
+    char *h[] = {"edoc", "history", (char *)legacy, NULL};
+    CHECK(run_cli(NULL, h) == 0,
+          "mx: history on legacy file exits 0 (no versions)");
+    char *d[] = {"edoc", "dump", (char *)legacy, NULL};
+    CHECK(run_cli(NULL, d) == 0,
+          "mx: dump on legacy file exits 0 (two sections)");
+    char *e[] = {"edoc", "export", (char *)legacy,
+                 "/tmp/mx_legacy_out.txt", NULL};
+    CHECK(run_cli(NULL, e) == 0, "mx: export document from legacy exits 0");
+    ByteBuffer out;
+    bool ok = read_whole_file_public("/tmp/mx_legacy_out.txt", &out) ==
+                  STORAGE_OK &&
+              out.len == strlen("legacy body without history");
+    bytebuffer_free(&out);
+    CHECK(ok, "mx: legacy document bytes exported intact");
+    char *vsel[] = {"edoc", "export", (char *)legacy, "-v",
+                    "1",     "/tmp/mx_v1.txt", NULL};
+    CHECK(run_cli(NULL, vsel) == 3,
+          "mx: version select on history-less file => 3");
+    unlink("/tmp/mx_legacy_out.txt");
+    unlink("/tmp/mx_v1.txt");
+    cleanup_path(legacy);
+  }
+
+  /* --- every stored version exports byte-exact; unicode names ------- */
+  {
+    const char *p = "/tmp/mx_versions.edoc";
+    cleanup_path(p);
+    StorageSession *s = NULL;
+    ByteBuffer doc;
+    StorageMetadata meta;
+    StorageOpenResult res;
+    storage_session_open(p, &s, &doc, &meta, &res);
+    bytebuffer_free(&doc);
+    enum { NV = 5 };
+    ByteBuffer keep[NV];
+    for (int i = 0; i < NV; i++) {
+      char body[64];
+      snprintf(body, sizeof(body), "payload of revision %d", i + 1);
+      make_doc(&keep[i], body);
+      storage_save(s, p, &keep[i], &meta);
+    }
+    CHECK(storage_history_rename(s, NV - 2, "α-version-β"),
+          "mx: unicode rename accepted");
+    storage_save(s, p, &keep[NV - 1], &meta); /* dedupe persists rename */
+    storage_session_close(s);
+
+    for (int id = 1; id <= NV; id++) {
+      char sel[16], outp[64];
+      snprintf(sel, sizeof(sel), "%d", id);
+      snprintf(outp, sizeof(outp), "/tmp/mx_v%d.out", id);
+      char *ex[] = {"edoc", "export", (char *)p, "-v", sel, outp, NULL};
+      CHECK(run_cli(NULL, ex) == 0, "mx: export -v <id> exits 0");
+      char exp[64];
+      snprintf(exp, sizeof(exp), "payload of revision %d", id);
+      ByteBuffer out;
+      bool eq = read_whole_file_public(outp, &out) == STORAGE_OK &&
+                out.len == strlen(exp) &&
+                memcmp(out.data, exp, out.len) == 0;
+      bytebuffer_free(&out);
+      CHECK(eq, "mx: exported snapshot matches stored revision bytes");
+      unlink(outp);
+    }
+    char *en[] = {"edoc",       "export",      (char *)p, "--name",
+                  "α-version-β", "/tmp/mx_uni.out", NULL};
+    CHECK(run_cli(NULL, en) == 0, "mx: export by unicode name exits 0");
+    ByteBuffer uo;
+    bool ueq = read_whole_file_public("/tmp/mx_uni.out", &uo) ==
+                   STORAGE_OK &&
+               uo.len == keep[1].len &&
+               memcmp(uo.data, keep[1].data, uo.len) == 0;
+    bytebuffer_free(&uo);
+    CHECK(ueq, "mx: unicode-named version exports its own bytes");
+    unlink("/tmp/mx_uni.out");
+
+    for (int i = 0; i < NV; i++)
+      bytebuffer_free(&keep[i]);
+    cleanup_path(p);
+  }
+
+  /* --- verify exit-code map for structural rejections ---------------- */
+  {
+    write_text_file("/tmp/mx_plain.txt", "nope", 4);
+
+    ByteBuffer img;
+    bytebuffer_init(&img);
+    put_le32(&img, 0x434F4445u);
+    put_le32(&img, 7u); /* future format version */
+    put_le64(&img, 1700000000);
+    append_edoc_footer(&img, 1); /* footer crc over header only */
+    write_text_file("/tmp/mx_future.edoc", img.data, img.len);
+    bytebuffer_free(&img);
+
+    char *v_bad[] = {"edoc", "verify", "/tmp/mx_plain.txt", NULL};
+    CHECK(run_cli(NULL, v_bad) == 3, "mx: verify non-container => 3");
+    char *v_fut[] = {"edoc", "verify", "/tmp/mx_future.edoc", NULL};
+    CHECK(run_cli(NULL, v_fut) == 3,
+          "mx: verify future format version => 3");
+    unlink("/tmp/mx_plain.txt");
+    unlink("/tmp/mx_future.edoc");
+  }
+
+  /* --- very long source filename -> capped title, valid output ------- */
+  {
+    char longname[600], src[700];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    snprintf(src, sizeof(src), "/tmp/%s.txt", longname);
+    FILE *f = fopen(src, "wb");
+    if (f) {
+      fputs("long name body", f);
+      fclose(f);
+      cleanup_path("/tmp/mx_long.edoc");
+      char *i[] = {"edoc", "import", src, "/tmp/mx_long.edoc", NULL};
+      CHECK(run_cli(NULL, i) == 0,
+            "mx: import with ~600-char filename succeeds");
+      char *vv[] = {"edoc", "verify", "/tmp/mx_long.edoc", NULL};
+      CHECK(run_cli(NULL, vv) == 0,
+            "mx: container from long-name import verifies");
+      unlink(src);
+      cleanup_path("/tmp/mx_long.edoc");
+    }
+  }
+
+  /* --- recovery report goes quiet after journal discard -------------- */
+  {
+    const char *p = "/tmp/mx_rec.edoc";
+    cleanup_path(p);
+    StorageSession *s = NULL;
+    ByteBuffer doc, edit;
+    StorageMetadata meta;
+    StorageOpenResult res;
+    storage_session_open(p, &s, &doc, &meta, &res);
+    bytebuffer_free(&doc);
+    make_doc(&doc, "base");
+    storage_save(s, p, &doc, &meta);
+    make_doc(&edit, "pending");
+    storage_journal_append(s, "insert", &edit);
+    bytebuffer_free(&edit);
+    storage_recovery_discard(s); /* user chose Discard */
+    storage_session_close(s);
+    bytebuffer_free(&doc);
+
+    StorageRecoveryReport rep;
+    CHECK(storage_recovery_report(p, &rep) == STORAGE_OK &&
+              !rep.journal_candidate,
+          "mx: discarded journal no longer reported pending");
+    bytebuffer_free(&rep.journal_doc);
+    cleanup_path(p);
+  }
+
+  /* --- toolkit API contracts on crafted/early-error inputs ----------- */
+  {
+    /* container with METADATA but no DOCUMENT => read_document fails */
+    ByteBuffer img;
+    bytebuffer_init(&img);
+    put_le32(&img, 0x434F4445u);
+    put_le32(&img, 1u);
+    put_le64(&img, 1700000000);
+    put_le32(&img, STORAGE_SECTION_METADATA);
+    put_le64(&img, 0u);
+    put_le32(&img, t_crc32((const uint8_t *)"", 0));
+    append_edoc_footer(&img, 1);
+    write_text_file("/tmp/mx_nodoc.edoc", img.data, img.len);
+    bytebuffer_free(&img);
+
+    ByteBuffer body;
+    CHECK(storage_read_document("/tmp/mx_nodoc.edoc", &body) ==
+              STORAGE_ERR_TRUNCATED,
+          "mx: read_document without DOCUMENT section => TRUNCATED");
+
+    /* inspect summary contract on structural early-outs */
+    write_text_file("/tmp/mx_short.edoc", "hi!", 3);
+    StorageInspectSummary sum;
+    InspectCtx ctx = {0, true, false, false, false};
+    StorageStatus st =
+        storage_inspect_file("/tmp/mx_short.edoc", &sum, NULL, NULL);
+    CHECK(st == STORAGE_ERR_TRUNCATED && sum.sections_walked == 0 &&
+              sum.file_size == 3,
+          "mx: below-minimum file => TRUNCATED, size reported");
+    write_text_file("/tmp/mx_notc.edoc",
+                    "plain text long enough to pass the length gate", 46);
+    sum.file_size = 0;
+    ctx.seen = 0;
+    st = storage_inspect_file("/tmp/mx_notc.edoc", &sum, inspect_collect,
+                              &ctx);
+    CHECK(st == STORAGE_ERR_BAD_MAGIC && ctx.seen == 0 &&
+              sum.sections_walked == 0 && sum.file_size == 46 &&
+              sum.format_version == 0,
+          "mx: BAD_MAGIC emits nothing; size populated, version untouched");
+    unlink("/tmp/mx_short.edoc");
+    unlink("/tmp/mx_notc.edoc");
+  }
+}
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -1517,7 +1742,9 @@ int main(void) {
   test_toolkit_recovery_report();
   test_cli_roundtrips();
   test_cli_adversarial();
+  test_consistency_matrix();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
