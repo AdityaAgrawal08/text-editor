@@ -10,6 +10,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* Fuzz-shim entry points (storage.c is compiled with -DSTORAGE_FUZZING
+   in the test build) so regression tests can hit parser internals. */
+StorageStatus fuzz_parse_edoc(const uint8_t *data, size_t len);
+StorageStatus fuzz_journal_scan(const uint8_t *data, size_t len);
+StorageStatus fuzz_history_parse(const uint8_t *data, size_t len,
+                                 size_t *out_count);
+
 static int g_failures = 0;
 
 #define CHECK(cond, msg)                                                       \
@@ -804,6 +811,171 @@ static void test_version_browser_flow(void) {
   cleanup_path(path);
 }
 
+/* ===================================================================== *
+ * W1 fuzz regressions: every finding from the fuzzing campaign gets a
+ * permanent test here. The suite runs under ASan/UBSan, so leaks and
+ * OOB accesses in these paths fail the build even when the return code
+ * looks innocent.
+ * ===================================================================== */
+
+/* CRC32 mirror (storage.c's is static) for crafting hostile images. */
+static uint32_t t_crc32(const uint8_t *d, size_t n) {
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) {
+    c ^= d[i];
+    for (int k = 0; k < 8; k++)
+      c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+  }
+  return c ^ 0xFFFFFFFFu;
+}
+
+static void put_le32(ByteBuffer *b, uint32_t v) {
+  uint8_t x[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
+                  (uint8_t)(v >> 24)};
+  bytebuffer_append(b, x, 4);
+}
+static void put_le64(ByteBuffer *b, uint64_t v) {
+  uint8_t x[8];
+  for (int i = 0; i < 8; i++)
+    x[i] = (uint8_t)(v >> (8 * i));
+  bytebuffer_append(b, x, 8);
+}
+
+/* Footer = {section_count, crc32(header+sections)}. Parser verifies
+   crc over exactly img->data[0 .. footer_start). */
+static void append_edoc_footer(ByteBuffer *img, uint32_t count) {
+  size_t body_end = img->len;
+  put_le32(img, count);
+  put_le32(img, t_crc32(img->data, body_end));
+}
+
+/* Reads a whole file via stdio (read_whole_file in storage.c is static). */
+static StorageStatus read_whole_file_public(const char *path,
+                                            ByteBuffer *out) {
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return STORAGE_ERR_NOT_FOUND;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  rewind(f);
+  bytebuffer_init(out);
+  if (sz <= 0 || !bytebuffer_reserve(out, (size_t)sz)) {
+    fclose(f);
+    return STORAGE_ERR_IO;
+  }
+  size_t got = fread(out->data, 1, (size_t)sz, f);
+  fclose(f);
+  out->len = got;
+  return got == (size_t)sz ? STORAGE_OK : STORAGE_ERR_TRUNCATED;
+}
+
+
+static void test_fuzz_regressions(void) {
+  /* F2 (libFuzzer crash artifact): crafted VER1 record whose doc_len
+     wraps the parser's additive bounds arithmetic. Used to SEGV in
+     parse_history_section; must now be rejected with zero versions. */
+  static const uint8_t wrap_record[] = {
+      0x56, 0x45, 0x52, 0x31, 0xc5, 0x44, 0x4f, 0x00, 0x43, 0x3d, 0x01,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0a, 0x0a, 0x00,
+      0x00, 0x00, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+      0xff, 0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+      0xff, 0x00, 0x5b};
+  size_t parsed = 99;
+  CHECK(fuzz_history_parse(wrap_record, sizeof(wrap_record), &parsed) ==
+                        STORAGE_OK &&
+                    parsed == 0,
+        "history: crafted length-wrap record rejected, zero versions");
+
+  /* Valid records must still parse after the bounds rewrite. */
+  ByteBuffer good;
+  bytebuffer_init(&good);
+  const char *gname = "v1";
+  const char *gdoc = "hello";
+  size_t body_at = good.len; /* record CRC spans from the magic byte */
+  put_le32(&good, 0x31524556u);
+  put_le64(&good, 1);
+  put_le64(&good, 1700000000);
+  put_le32(&good, (uint32_t)strlen(gname));
+  bytebuffer_append(&good, gname, strlen(gname));
+  put_le64(&good, (uint64_t)strlen(gdoc));
+  put_le32(&good, t_crc32((const uint8_t *)gdoc, strlen(gdoc)));
+  bytebuffer_append(&good, gdoc, strlen(gdoc));
+  put_le32(&good, t_crc32(good.data + body_at, good.len - body_at));
+  parsed = 0;
+  CHECK(fuzz_history_parse(good.data, good.len, &parsed) == STORAGE_OK &&
+                    parsed == 1,
+        "history: valid handcrafted record still parses");
+  bytebuffer_free(&good);
+
+  /* F1: container truncated right after a section header used to leak
+     the document buffer on STORAGE_ERR_TRUNCATED. Footer CRC is valid
+     so parsing reaches the section loop. */
+  ByteBuffer trunc;
+  bytebuffer_init(&trunc);
+  put_le32(&trunc, 0x434F4445u);
+  put_le32(&trunc, 1u);
+  put_le64(&trunc, 1700000000);
+  put_le32(&trunc, 1u);  /* type = DOCUMENT */
+  put_le64(&trunc, 4u);  /* payload_len claims bytes that aren't there */
+  put_le32(&trunc, 0u);  /* payload crc (never reached) */
+  append_edoc_footer(&trunc, 1);
+  CHECK(fuzz_parse_edoc(trunc.data, trunc.len) == STORAGE_ERR_TRUNCATED,
+        "edoc: mid-section truncation reported, no leak");
+  bytebuffer_free(&trunc);
+
+  /* F3: section header whose payload_len wraps additive checks. */
+  ByteBuffer evil;
+  bytebuffer_init(&evil);
+  put_le32(&evil, 0x434F4445u); /* STORAGE_MAGIC */
+  put_le32(&evil, 1u);          /* format version */
+  put_le64(&evil, 1700000000);  /* created_at */
+  put_le32(&evil, 1u);          /* type = DOCUMENT */
+  put_le64(&evil, UINT64_MAX - 20); /* off(32)+payload_len wraps small */
+  put_le32(&evil, 0u);          /* payload crc (never reached) */
+  append_edoc_footer(&evil, 1);
+  CHECK(fuzz_parse_edoc(evil.data, evil.len) == STORAGE_ERR_TRUNCATED,
+        "edoc: wrapping payload_len rejected without OOB");
+  bytebuffer_free(&evil);
+
+  /* F4: journal record with wrapping doc_len must not reach a wild
+     read; scanner falls back to NOT_FOUND for this sole record. */
+  const char *jpath_file = "/tmp/edoc_test_fuzzjournal.edoc";
+  cleanup_path(jpath_file);
+  StorageSession *js = NULL;
+  ByteBuffer jdoc, jcontent;
+  StorageMetadata jmeta;
+  StorageOpenResult jres;
+  if (storage_session_open(jpath_file, &js, &jdoc, &jmeta, &jres) ==
+      STORAGE_OK) {
+    bytebuffer_free(&jdoc);
+    make_doc(&jcontent, "journal payload");
+    storage_journal_append(js, "insert", &jcontent);
+    bytebuffer_free(&jcontent);
+    storage_session_close(js);
+
+    char jpath[512];
+    snprintf(jpath, sizeof(jpath), "%s.journal", jpath_file);
+    ByteBuffer j;
+    if (read_whole_file_public(jpath, &j) == STORAGE_OK && j.len > 48) {
+      /* layout: u64 rec_total | u64 ts | u32 op_len | op | u64 doc_len
+         | doc | u32 crc | u64 rec_total */
+      uint64_t rec_total;
+      memcpy(&rec_total, j.data, 8);
+      size_t doc_len_off = 8 + 8 + 4 + 6; /* ts+op_len+strlen("insert") */
+      uint64_t evil_len = UINT64_MAX - doc_len_off - 4 + 1; /* wraps small */
+      memcpy(j.data + doc_len_off, &evil_len, 8);
+      /* fix record body CRC so ONLY the length guard can reject it */
+      size_t body_len = (size_t)rec_total - 4;
+      uint32_t crc = t_crc32(j.data + 8, body_len);
+      memcpy(j.data + 8 + body_len, &crc, 4);
+      CHECK(fuzz_journal_scan(j.data, j.len) == STORAGE_ERR_NOT_FOUND,
+            "journal: wrapping doc_len rejected without OOB");
+      bytebuffer_free(&j);
+    }
+    cleanup_path(jpath_file);
+  }
+}
+
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -820,6 +992,7 @@ int main(void) {
   test_history_stress_many_saves();
   test_save_as_rebinds_siblings();
   test_version_browser_flow();
+  test_fuzz_regressions();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

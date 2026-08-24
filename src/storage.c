@@ -492,16 +492,22 @@ static StorageStatus parse_edoc_image(const uint8_t *data, size_t len,
   size_t end = len - 8; /* exclude footer */
 
   for (uint32_t i = 0; i < section_count; i++) {
-    if (off + SECTION_HEADER_SIZE > end)
+    if (end - off < SECTION_HEADER_SIZE) {
+      bytebuffer_free(out_document);
       return STORAGE_ERR_TRUNCATED;
+    }
 
     uint32_t type = read_u32_le(data + off);
     uint64_t payload_len = read_u64_le(data + off + 4);
     uint32_t payload_crc = read_u32_le(data + off + 12);
     off += SECTION_HEADER_SIZE;
 
-    if (off + payload_len > end)
+    /* Subtraction-based bound: immune to the payload_len+off wraparound
+       an additive check suffers on attacker-chosen lengths. */
+    if (payload_len > (uint64_t)(end - off)) {
+      bytebuffer_free(out_document);
       return STORAGE_ERR_TRUNCATED;
+    }
 
     uint32_t computed_crc = crc32_compute(data + off, (size_t)payload_len);
     if (computed_crc != payload_crc) {
@@ -695,14 +701,15 @@ static StorageStatus journal_find_last_valid(const uint8_t *data, size_t len,
     size_t off = 8; /* skip timestamp */
     uint32_t op_len = read_u32_le(rec + off);
     off += 4;
-    if (off + op_len + 8 > rec_len - 4) {
+    if ((size_t)(rec_len - 4) - off < (size_t)op_len + 8) {
       cursor = rec_start - 8;
       continue;
     }
     off += op_len;
     uint64_t doc_len = read_u64_le(rec + off);
     off += 8;
-    if (off + doc_len > rec_len - 4) {
+    /* Subtraction-based: an additive check wraps for huge doc_len. */
+    if ((uint64_t)(rec_len - 4 - off) < doc_len) {
       cursor = rec_start - 8;
       continue;
     }
@@ -817,44 +824,47 @@ static StorageStatus parse_history_section(const uint8_t *data, size_t len,
   memset(&scratch, 0, sizeof(scratch));
 
   size_t off = 0;
-  while (off + 4 <= len) {
+  while (len - off >= 4) {
     uint32_t magic = read_u32_le(data + off);
     if (magic != STORAGE_VERSION_REC_MAGIC)
       break; /* unknown tail bytes: stop defensively */
 
-    if (off + 4 + 8 + 8 + 4 > len)
+    size_t rec_start = off; /* CRC span start, tracked without arithmetic */
+    if (len - off < 24)
       break;
     uint64_t id = read_u64_le(data + off + 4);
     uint64_t ts = read_u64_le(data + off + 12);
     uint32_t name_len = read_u32_le(data + off + 20);
     off += 24;
 
-    if (name_len >= STORAGE_VERSION_NAME_MAX || off + name_len > len)
+    if (name_len >= STORAGE_VERSION_NAME_MAX || len - off < name_len)
       break;
     const char *name = (const char *)(data + off);
     off += name_len;
 
-    if (off + 8 + 4 > len)
+    /* All remaining bounds are subtraction-based: additive checks such
+       as `off + doc_len + 4 > len` wrap around for attacker-chosen
+       lengths and let the parser walk far past the buffer (found by
+       libFuzzer: crafted VER1 record => SEGV). */
+    if (len - off < 12)
       break;
     uint64_t doc_len = read_u64_le(data + off);
-    off += 12; /* doc_len field (8) + stored per-record doc CRC (4); the
-                  record CRC below re-covers the whole body, so the
-                  standalone doc CRC is read implicitly via body check */
+    off += 12;
 
-    if (doc_len > SIZE_MAX - 1 || off + doc_len + 4 > len)
+    if ((uint64_t)(len - off) < doc_len)
+      break;
+    if ((uint64_t)(len - off) - doc_len < 4)
       break;
 
     const uint8_t *doc = data + off;
     off += (size_t)doc_len;
-    if (off + 4 > len)
-      break;
-    uint32_t rec_crc = read_u32_le(data + off);
-    off += 4;
 
-    /* Per-record CRC over everything from magic through doc bytes. */
-    size_t body_len =
-        4 + 8 + 8 + 4 + name_len + 8 + 4 + (size_t)doc_len;
-    if (crc32_compute(data + off - 4 - body_len, body_len) != rec_crc)
+    /* Stored rec_crc covers magic..doc only — capture the span before
+       consuming the CRC field itself. */
+    uint32_t rec_crc = read_u32_le(data + off);
+    size_t body_len = off - rec_start;
+    off += 4;
+    if (crc32_compute(data + rec_start, body_len) != rec_crc)
       continue; /* skip this record, try the next */
 
     char name_buf[STORAGE_VERSION_NAME_MAX];
@@ -1469,3 +1479,49 @@ const char *storage_status_string(StorageStatus status) {
   }
   return "unknown error";
 }
+
+/* ===================================================================== *
+ * Fuzz-harness entry points (compiled out unless -DSTORAGE_FUZZING).
+ * Each wrapper owns full cleanup so a harness can call it millions of
+ * times with arbitrary bytes; behavior is identical to production paths.
+ * ===================================================================== */
+#ifdef STORAGE_FUZZING
+
+StorageStatus fuzz_parse_edoc(const uint8_t *data, size_t len) {
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageVersion *hist = NULL;
+  size_t hist_len = 0;
+  StorageStatus st =
+      parse_edoc_image(data, len, &doc, &meta, &hist, &hist_len);
+  /* Ownership contract of parse_edoc_image: on STORAGE_OK the document
+   * buffer is live and ours; on any failure it was freed internally.
+   * History, however, is ALWAYS caller-owned whenever the pointer was
+   * set — including failure paths that abort mid-section-loop. */
+  if (st == STORAGE_OK)
+    bytebuffer_free(&doc);
+  history_free(hist, hist_len);
+  return st;
+}
+
+StorageStatus fuzz_journal_scan(const uint8_t *data, size_t len) {
+  ByteBuffer doc;
+  bytebuffer_init(&doc);
+  StorageStatus st = journal_find_last_valid(data, len, &doc);
+  if (st == STORAGE_OK)
+    bytebuffer_free(&doc);
+  return st;
+}
+
+StorageStatus fuzz_history_parse(const uint8_t *data, size_t len,
+                                 size_t *out_count) {
+  StorageVersion *hist = NULL;
+  size_t hist_len = 0;
+  parse_history_section(data, len, &hist, &hist_len);
+  history_free(hist, hist_len);
+  if (out_count)
+    *out_count = hist_len;
+  return STORAGE_OK;
+}
+
+#endif /* STORAGE_FUZZING */
