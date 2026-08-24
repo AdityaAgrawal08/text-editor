@@ -976,6 +976,216 @@ static void test_fuzz_regressions(void) {
   }
 }
 
+/* ===================================================================== *
+ * W2: read-only toolkit API
+ * ===================================================================== */
+
+typedef struct {
+  size_t seen;
+  bool all_crc_ok;
+  bool has_document, has_metadata, has_versions;
+} InspectCtx;
+
+static void inspect_collect(const StorageSectionInfo *info, void *user) {
+  InspectCtx *c = user;
+  c->seen++;
+  if (!info->crc_ok)
+    c->all_crc_ok = false;
+  if (info->type == STORAGE_SECTION_DOCUMENT)
+    c->has_document = true;
+  else if (info->type == STORAGE_SECTION_METADATA)
+    c->has_metadata = true;
+  else if (info->type == STORAGE_SECTION_VERSIONS)
+    c->has_versions = true;
+}
+
+static void test_toolkit_inspect(void) {
+  const char *path = "/tmp/edoc_test_inspect.edoc";
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc, c1, c2;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&c1, "inspect one");
+  make_doc(&c2, "inspect two");
+  storage_save(s, path, &c1, &meta);
+  storage_save(s, path, &c2, &meta); /* adds VERSIONS section */
+  storage_session_close(s);
+
+  StorageInspectSummary sum;
+  InspectCtx ctx = {0, true, false, false, false};
+  StorageStatus st =
+      storage_inspect_file(path, &sum, inspect_collect, &ctx);
+  CHECK(st == STORAGE_OK, "inspect: clean file walks OK");
+  CHECK(sum.footer_crc_ok, "inspect: footer CRC valid on clean file");
+  CHECK(sum.section_count == 3 && sum.sections_walked == 3,
+        "inspect: document+metadata+versions all walked");
+  CHECK(ctx.has_document && ctx.has_metadata && ctx.has_versions,
+        "inspect: callback saw every section type");
+  CHECK(ctx.all_crc_ok, "inspect: all payload CRCs valid");
+  CHECK(sum.file_size > 0, "inspect: file_size populated");
+
+  /* Corrupt a payload byte -> CRC flags flip, walk still completes. */
+  FILE *f = fopen(path, "r+b");
+  CHECK(f != NULL, "inspect: reopen for corruption injection");
+  if (f) {
+    fseek(f, 40, SEEK_SET);
+    int ch = fgetc(f);
+    fseek(f, 40, SEEK_SET);
+    fputc(ch ^ 0x40, f);
+    fclose(f);
+
+    InspectCtx bad = {0, true, false, false, false};
+    st = storage_inspect_file(path, &sum, inspect_collect, &bad);
+    /* Contract: walk completes and reports every section, but the
+       status surfaces the checksum damage instead of reading clean. */
+    CHECK(st == STORAGE_ERR_CORRUPT_CHECKSUM && bad.seen == 3 &&
+              !sum.footer_crc_ok,
+          "inspect: corrupted file fully walkable, status flags damage");
+  }
+
+  /* Truncation, deterministic form: valid footer but the single claimed
+     section claims more bytes than exist -> TRUNCATED, nothing walked. */
+  ByteBuffer timg;
+  bytebuffer_init(&timg);
+  put_le32(&timg, 0x434F4445u); /* STORAGE_MAGIC */
+  put_le32(&timg, 1u);          /* format version */
+  put_le64(&timg, 1700000000);  /* created_at */
+  put_le32(&timg, 1u);          /* type = DOCUMENT */
+  put_le64(&timg, 9999u);       /* payload_len: bytes that aren't there */
+  put_le32(&timg, 0u);          /* payload crc (never reached) */
+  append_edoc_footer(&timg, 1);
+  char tpath[512];
+  snprintf(tpath, sizeof(tpath), "%s.trunc", path);
+  FILE *tf = fopen(tpath, "wb");
+  CHECK(tf != NULL, "inspect: can write crafted truncated file");
+  if (tf) {
+    fwrite(timg.data, 1, timg.len, tf);
+    fclose(tf);
+    InspectCtx tc = {0, true, false, false, false};
+    st = storage_inspect_file(tpath, &sum, inspect_collect, &tc);
+    CHECK(st == STORAGE_ERR_TRUNCATED && sum.sections_walked == 0 &&
+              sum.section_count == 1,
+          "inspect: oversized section claim => TRUNCATED, zero walked");
+    unlink(tpath);
+  }
+  bytebuffer_free(&timg);
+
+  /* Blind slice of a real container must never read as clean. */
+  ByteBuffer raw;
+  if (read_whole_file_public(path, &raw) == STORAGE_OK) {
+    snprintf(tpath, sizeof(tpath), "%s.slice", path);
+    tf = fopen(tpath, "wb");
+    if (tf) {
+      fwrite(raw.data, 1, 30, tf);
+      fclose(tf);
+      st = storage_inspect_file(tpath, &sum, NULL, NULL);
+      CHECK(st != STORAGE_OK,
+            "inspect: sliced file is never reported OK");
+      unlink(tpath);
+    }
+    bytebuffer_free(&raw);
+  }
+
+  /* Non-EDOC input rejected without side effects. */
+  char npath[512];
+  snprintf(npath, sizeof(npath), "%s.txt", path);
+  f = fopen(npath, "wb");
+  if (f) {
+    fputs("plain text, not a container", f);
+    fclose(f);
+    st = storage_inspect_file(npath, &sum, NULL, NULL);
+    CHECK(st == STORAGE_ERR_BAD_MAGIC, "inspect: plain text => BAD_MAGIC");
+    unlink(npath);
+  }
+
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+  cleanup_path(path);
+}
+
+static void test_toolkit_read_versions(void) {
+  const char *path = "/tmp/edoc_test_rdver.edoc";
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc, c1, c2;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&c1, "first snapshot");
+  make_doc(&c2, "second snapshot, current");
+  storage_save(s, path, &c1, &meta);
+  storage_save(s, path, &c2, &meta);
+  storage_session_close(s);
+
+  StorageVersion *vers = NULL;
+  size_t n = 0;
+  StorageStatus st = storage_read_versions(path, &vers, &n);
+  CHECK(st == STORAGE_OK && n == 2, "read_versions: both snapshots found");
+  if (st == STORAGE_OK && n == 2) {
+    CHECK(vers[0].doc.len == c1.len &&
+              memcmp(vers[0].doc.data, c1.data, c1.len) == 0,
+          "read_versions: oldest entry matches v1 bytes");
+    CHECK(strcmp(vers[1].name, "v2") == 0,
+          "read_versions: auto-name carried through");
+  }
+  storage_versions_free(vers, n);
+
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+  cleanup_path(path);
+}
+
+static void test_toolkit_recovery_report(void) {
+  const char *path = "/tmp/edoc_test_recreport.edoc";
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc, base, edit;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&base, "saved baseline");
+  storage_save(s, path, &base, &meta);
+
+  StorageRecoveryReport rep;
+  CHECK(storage_recovery_report(path, &rep) == STORAGE_OK,
+        "recovery_report: succeeds on clean file");
+  CHECK(!rep.journal_candidate && !rep.autosave_exists,
+        "recovery_report: nothing pending on clean file");
+
+  make_doc(&edit, "baseline plus unsaved work");
+  storage_journal_append(s, "insert", &edit);
+  storage_session_close(s); /* crash simulation: close without save */
+
+  CHECK(storage_recovery_report(path, &rep) == STORAGE_OK,
+        "recovery_report: reads journaled state");
+  CHECK(rep.journal_candidate && rep.journal_doc.len == edit.len &&
+            memcmp(rep.journal_doc.data, edit.data, edit.len) == 0,
+        "recovery_report: journal tail matches pending edit");
+  bytebuffer_free(&rep.journal_doc);
+
+  s = NULL;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  sleep(1); /* guarantee mtime separation from the explicit save */
+  bytebuffer_free(&edit); /* release pre-reuse contents */
+  make_doc(&edit, "autosaved progress");
+  storage_mark_dirty(s);
+  storage_autosave_tick(s, &edit, &meta, 5000);
+  storage_session_close(s);
+  CHECK(storage_recovery_report(path, &rep) == STORAGE_OK &&
+                rep.autosave_exists && rep.autosave_newer_than_main,
+        "recovery_report: fresh autosave flagged newer than main");
+  bytebuffer_free(&rep.journal_doc);
+  bytebuffer_free(&base);
+  bytebuffer_free(&edit);
+  cleanup_path(path);
+}
+
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -993,6 +1203,9 @@ int main(void) {
   test_save_as_rebinds_siblings();
   test_version_browser_flow();
   test_fuzz_regressions();
+  test_toolkit_inspect();
+  test_toolkit_read_versions();
+  test_toolkit_recovery_report();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

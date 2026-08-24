@@ -273,4 +273,66 @@ const char *storage_status_string(StorageStatus status);
 bool storage_backup_path(const char *path, int index, char *out_path,
                          size_t out_path_size);
 
+/* ---- Read-only toolkit API ---------------------------------------------
+ *
+ * These entry points exist so external tools (`edoc` CLI, scripts,
+ * verifiers) can query document files WITHOUT any session side effects:
+ * no journal fd is created, no stale-tmp sweep runs, nothing on disk is
+ * written. Contrast storage_session_open(), which prepares a workspace.
+ * ---------------------------------------------------------------------- */
+
+/* One section's structural record as found in the file. `crc_ok` compares
+   the stored payload CRC against a fresh computation; `payload_off` is the
+   absolute file offset of the payload bytes. */
+typedef struct {
+  uint32_t type;        /* StorageSectionType value (may be unknown) */
+  uint64_t payload_len;
+  uint32_t payload_crc;
+  bool crc_ok;
+  uint64_t payload_off;
+} StorageSectionInfo;
+
+typedef struct {
+  uint32_t format_version;      /* claimed by header (not validated) */
+  uint64_t header_created_at;
+  uint32_t section_count;       /* claimed by footer */
+  size_t sections_walked;       /* how many were safely iterated */
+  bool footer_crc_ok;           /* whole-file checksum over header+sections */
+  uint64_t file_size;
+} StorageInspectSummary;
+
+/* Callback receives one entry per section successfully walked. */
+typedef void (*storage_section_iter_fn)(const StorageSectionInfo *info,
+                                        void *user);
+
+/* Structural walk of an EDOC file. Tolerates corruption: sections are
+ * emitted while safe and `out_summary.sections_walked` reflects how far
+ * it got, with STORAGE_ERR_TRUNCATED signalling an early stop. Returns
+ * STORAGE_ERR_BAD_MAGIC / _UNSUPPORTED_VERSION for non-EDOC inputs.
+ * Pure read: never writes to `path` or its siblings. */
+StorageStatus storage_inspect_file(const char *path,
+                                   StorageInspectSummary *out_summary,
+                                   storage_section_iter_fn fn, void *user);
+
+/* Reads the embedded version history without opening a session.
+ * Array is oldest-first internally (index count-1 = newest). Caller
+ * frees via storage_versions_free(). */
+StorageStatus storage_read_versions(const char *path,
+                                    StorageVersion **out_versions,
+                                    size_t *out_count);
+void storage_versions_free(StorageVersion *versions, size_t count);
+
+/* Non-destructive crash-recovery report for `path`. Populated from the
+ * `.journal` sibling (latest valid record, if any) and `.autosave`
+ * freshness versus the main file. Never modifies anything. */
+typedef struct {
+  bool journal_candidate;   /* valid tail record exists */
+  ByteBuffer journal_doc;   /* recovered snapshot; valid iff candidate */
+  bool autosave_exists;
+  bool autosave_newer_than_main;
+} StorageRecoveryReport;
+
+StorageStatus storage_recovery_report(const char *path,
+                                      StorageRecoveryReport *out_report);
+
 #endif /* EDITOR_STORAGE_H */
