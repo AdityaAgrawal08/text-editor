@@ -120,28 +120,37 @@ Hardening pass (verification round):
 ## W2 — P2: EDOC toolkit & specification (~1 week)
 
 ### Tasks
-- [ ] `docs/EDOC_SPEC.md`: byte-layout diagrams; field tables; endianness policy;
+- [x] `docs/EDOC_SPEC.md`: byte-layout diagrams; field tables; endianness policy;
       CRC coverage map (which bytes each CRC protects); atomicity contract
       (tmp→fsync→rename→dir-fsync); WAL design incl. torn-record backward-scan algorithm;
       schema-version migration policy (v1 today, how v2 would land)
-- [ ] Read-only introspection API in storage (no side effects: no journal fd creation,
+- [x] Read-only introspection API in storage (no side effects: no journal fd creation,
       no tmp sweep): `storage_inspect_file()` returning section table
-- [ ] CLI `src/edoc_cli.c` → `build/edoc` (links storage.o only):
-      `verify FILE` · `dump FILE` · `history FILE` · `export FILE [-v N|name] OUT`
+- [x] CLI `src/edoc_cli.c` → `build/edoc` (links storage.o only):
+      `verify FILE` · `dump FILE` · `history FILE` · `export FILE [-v ID|name] OUT`
       · `import TXT FILE` · `recover FILE`
-- [ ] Roundtrip property test: export→import→verify byte-equal
+- [x] Roundtrip property test: export→import→verify byte-equal
       (cases: empty doc, unicode, large ~10 MB)
 
-### Validation
-```
-./build/edoc verify untitled.edoc            # exit 0 + per-section report
-./build/edoc dump untitled.edoc              # section table w/ lengths + CRC status
-./build/edoc history <any saved file>        # id/name/date/size rows
-./build/edoc export f.edoc /tmp/out.txt && diff <(original bytes) /tmp/out.txt   # equal
-printf 'hello' > /tmp/t.txt && ./build/edoc import /tmp/t.txt /tmp/t.edoc \
-  && ./build/edoc verify /tmp/t.edoc         # exit 0
-make test                                     # roundtrip tests green
-```
+### Evidence
+Branch `feature/edoc-toolkit-and-spec`, commits fdc6ca7 → 70c2fc0 → 9fc4292 →
+c73648d → 39cabb9 → 9bd7017 (+ docs sync). Highlights:
+
+- Introspection contract hardened during testing: a sliced file whose claimed
+  section-count is zero can no longer read as OK; corruption is surfaced via
+  status while the walk still reports every section.
+- Export `-v N` selects by version ID (matches history output and v<N>
+  auto-names); recency-ordinal semantics rejected as a user-trap.
+- Adversarial round fixed: self-clobbering import destroyed its source;
+  forced import's unlink opened a reader-visible disappearance window
+  (proven by 8-writer/120-reader storm) — both fixed, storms re-run clean.
+  SIGKILL crash storm: container always verifiable, exactly one complete image.
+- Consistency matrix (20 checks): legacy files across all commands,
+  per-version export byte-fidelity incl. unicode names, verify exit-code map,
+  long-filename imports, post-discard recovery quieting, introspection
+  early-out summary contracts.
+- Static analysis clean: gcc -fanalyzer 0 findings, clang --analyze 0 findings.
+- Full suite green under gcc+clang with -Werror + _FORTIFY_SOURCE=2.
 
 ---
 

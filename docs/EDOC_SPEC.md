@@ -63,10 +63,9 @@ Defined types:
 Unknown types are **skipped, never rejected** — forward compatibility:
 older readers open newer files that carry extra sections.
 
-Exactly one DOCUMENT section is required. METADATA is optional-in-
-theory but always written by v1 implementations. Readers must treat
-absence of either as a structural failure (`TRUNCATED`), matching the
-reference parser.
+Exactly one DOCUMENT section is required. METADATA is optional:
+readers tolerate its absence by using zeroed defaults (the reference
+parser does exactly this), though v1 writers always emit it.
 
 ### 3.3 METADATA payload
 

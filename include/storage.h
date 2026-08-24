@@ -309,7 +309,11 @@ typedef void (*storage_section_iter_fn)(const StorageSectionInfo *info,
  * emitted while safe and `out_summary.sections_walked` reflects how far
  * it got, with STORAGE_ERR_TRUNCATED signalling an early stop. Returns
  * STORAGE_ERR_BAD_MAGIC / _UNSUPPORTED_VERSION for non-EDOC inputs.
- * Pure read: never writes to `path` or its siblings. */
+ * Pure read: never writes to `path` or its siblings.
+ *
+ * Summary-field contract on early returns: `file_size` is always
+ * populated; `format_version` is set only once the header magic has
+ * validated; all other fields are meaningful only on a full walk. */
 StorageStatus storage_inspect_file(const char *path,
                                    StorageInspectSummary *out_summary,
                                    storage_section_iter_fn fn, void *user);
