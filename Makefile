@@ -22,6 +22,7 @@ SRC_DIR   := src
 EDITOR_BIN       := $(BUILD_DIR)/editor
 TEST_STORAGE_BIN := $(BUILD_DIR)/test_storage
 FUZZ_BIN         := $(BUILD_DIR)/fuzz_harness
+EDOC_BIN         := $(BUILD_DIR)/edoc
 
 # Editor sources (all .c files except the test harness)
 EDITOR_SRCS := \
@@ -40,6 +41,9 @@ TEST_STORAGE_OBJS := $(TEST_STORAGE_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/test_%.o)
 FUZZ_SRCS := $(SRC_DIR)/storage.c $(SRC_DIR)/fuzz_harness.c
 FUZZ_OBJS := $(FUZZ_SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/fuzz_%.o)
 
+# edoc CLI: storage.o + cli front-end only (no SDL/FreeType)
+EDOC_OBJS := $(BUILD_DIR)/storage.o $(BUILD_DIR)/edoc_cli.o
+
 # libFuzzer variant (clang only): coverage-guided, same shim + entry macro
 LF_CFLAGS := $(CSTD) $(WARN) -g -O1 $(INCLUDE) -DSTORAGE_FUZZING -DLIBFUZZER \
              -fsanitize=fuzzer-no-link,fuzzer
@@ -51,7 +55,7 @@ endif
 
 .PHONY: all clean test run debug fuzz fuzz-libfuzzer
 
-all: $(EDITOR_BIN)
+all: $(EDITOR_BIN) $(EDOC_BIN)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -69,6 +73,9 @@ $(BUILD_DIR)/fuzz_%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 
 $(FUZZ_BIN): $(FUZZ_OBJS) | $(BUILD_DIR)
 	$(CC) $(CSTD) $(WARN) -g -O1 $(SANITIZE) $(FUZZ_OBJS) -o $@ -lm
+
+$(EDOC_BIN): $(EDOC_OBJS) | $(BUILD_DIR)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(SANITIZE) $(EDOC_OBJS) -o $@ $(LDFLAGS)
 
 # N and SEED are overridable: make fuzz N=5000000 SEED=7
 N ?= 1000000
@@ -114,5 +121,6 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 DEPS := $(EDITOR_OBJS:.o=.d) $(TEST_STORAGE_OBJS:.o=.d) \
-        $(FUZZ_OBJS:.o=.d) $(LF_OBJS:.o=.d)
+        $(FUZZ_OBJS:.o=.d) $(LF_OBJS:.o=.d) \
+        $(BUILD_DIR)/edoc_cli.d
 -include $(DEPS)
