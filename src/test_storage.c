@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Fuzz-shim entry points (storage.c is compiled with -DSTORAGE_FUZZING
@@ -704,7 +706,6 @@ static void test_history_stress_many_saves(void) {
 static void test_save_as_rebinds_siblings(void) {
   const char *A = "/tmp/edoc_test_sa_a.edoc";
   const char *B = "/tmp/edoc_test_sa_b.edoc";
-  char buf[4096];
   cleanup_path(A);
   cleanup_path(B);
 
@@ -859,9 +860,17 @@ static StorageStatus read_whole_file_public(const char *path,
   long sz = ftell(f);
   rewind(f);
   bytebuffer_init(out);
-  if (sz <= 0 || !bytebuffer_reserve(out, (size_t)sz)) {
+  if (sz < 0) {
     fclose(f);
     return STORAGE_ERR_IO;
+  }
+  if (sz == 0) { /* empty files are valid input, not an error */
+    fclose(f);
+    return STORAGE_OK;
+  }
+  if (!bytebuffer_reserve(out, (size_t)sz)) {
+    fclose(f);
+    return STORAGE_ERR_NOMEM;
   }
   size_t got = fread(out->data, 1, (size_t)sz, f);
   fclose(f);
@@ -976,6 +985,766 @@ static void test_fuzz_regressions(void) {
   }
 }
 
+/* ===================================================================== *
+ * W2: read-only toolkit API
+ * ===================================================================== */
+
+typedef struct {
+  size_t seen;
+  bool all_crc_ok;
+  bool has_document, has_metadata, has_versions;
+} InspectCtx;
+
+static void inspect_collect(const StorageSectionInfo *info, void *user) {
+  InspectCtx *c = user;
+  c->seen++;
+  if (!info->crc_ok)
+    c->all_crc_ok = false;
+  if (info->type == STORAGE_SECTION_DOCUMENT)
+    c->has_document = true;
+  else if (info->type == STORAGE_SECTION_METADATA)
+    c->has_metadata = true;
+  else if (info->type == STORAGE_SECTION_VERSIONS)
+    c->has_versions = true;
+}
+
+static void test_toolkit_inspect(void) {
+  const char *path = "/tmp/edoc_test_inspect.edoc";
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc, c1, c2;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&c1, "inspect one");
+  make_doc(&c2, "inspect two");
+  storage_save(s, path, &c1, &meta);
+  storage_save(s, path, &c2, &meta); /* adds VERSIONS section */
+  storage_session_close(s);
+
+  StorageInspectSummary sum;
+  InspectCtx ctx = {0, true, false, false, false};
+  StorageStatus st =
+      storage_inspect_file(path, &sum, inspect_collect, &ctx);
+  CHECK(st == STORAGE_OK, "inspect: clean file walks OK");
+  CHECK(sum.footer_crc_ok, "inspect: footer CRC valid on clean file");
+  CHECK(sum.section_count == 3 && sum.sections_walked == 3,
+        "inspect: document+metadata+versions all walked");
+  CHECK(ctx.has_document && ctx.has_metadata && ctx.has_versions,
+        "inspect: callback saw every section type");
+  CHECK(ctx.all_crc_ok, "inspect: all payload CRCs valid");
+  CHECK(sum.file_size > 0, "inspect: file_size populated");
+
+  /* Corrupt a payload byte -> CRC flags flip, walk still completes. */
+  FILE *f = fopen(path, "r+b");
+  CHECK(f != NULL, "inspect: reopen for corruption injection");
+  if (f) {
+    fseek(f, 40, SEEK_SET);
+    int ch = fgetc(f);
+    fseek(f, 40, SEEK_SET);
+    fputc(ch ^ 0x40, f);
+    fclose(f);
+
+    InspectCtx bad = {0, true, false, false, false};
+    st = storage_inspect_file(path, &sum, inspect_collect, &bad);
+    /* Contract: walk completes and reports every section, but the
+       status surfaces the checksum damage instead of reading clean. */
+    CHECK(st == STORAGE_ERR_CORRUPT_CHECKSUM && bad.seen == 3 &&
+              !sum.footer_crc_ok,
+          "inspect: corrupted file fully walkable, status flags damage");
+  }
+
+  /* Truncation, deterministic form: valid footer but the single claimed
+     section claims more bytes than exist -> TRUNCATED, nothing walked. */
+  ByteBuffer timg;
+  bytebuffer_init(&timg);
+  put_le32(&timg, 0x434F4445u); /* STORAGE_MAGIC */
+  put_le32(&timg, 1u);          /* format version */
+  put_le64(&timg, 1700000000);  /* created_at */
+  put_le32(&timg, 1u);          /* type = DOCUMENT */
+  put_le64(&timg, 9999u);       /* payload_len: bytes that aren't there */
+  put_le32(&timg, 0u);          /* payload crc (never reached) */
+  append_edoc_footer(&timg, 1);
+  char tpath[512];
+  snprintf(tpath, sizeof(tpath), "%s.trunc", path);
+  FILE *tf = fopen(tpath, "wb");
+  CHECK(tf != NULL, "inspect: can write crafted truncated file");
+  if (tf) {
+    fwrite(timg.data, 1, timg.len, tf);
+    fclose(tf);
+    InspectCtx tc = {0, true, false, false, false};
+    st = storage_inspect_file(tpath, &sum, inspect_collect, &tc);
+    CHECK(st == STORAGE_ERR_TRUNCATED && sum.sections_walked == 0 &&
+              sum.section_count == 1,
+          "inspect: oversized section claim => TRUNCATED, zero walked");
+    unlink(tpath);
+  }
+  bytebuffer_free(&timg);
+
+  /* Blind slice of a real container must never read as clean. */
+  ByteBuffer raw;
+  if (read_whole_file_public(path, &raw) == STORAGE_OK) {
+    snprintf(tpath, sizeof(tpath), "%s.slice", path);
+    tf = fopen(tpath, "wb");
+    if (tf) {
+      fwrite(raw.data, 1, 30, tf);
+      fclose(tf);
+      st = storage_inspect_file(tpath, &sum, NULL, NULL);
+      CHECK(st != STORAGE_OK,
+            "inspect: sliced file is never reported OK");
+      unlink(tpath);
+    }
+    bytebuffer_free(&raw);
+  }
+
+  /* Non-EDOC input rejected without side effects. */
+  char npath[512];
+  snprintf(npath, sizeof(npath), "%s.txt", path);
+  f = fopen(npath, "wb");
+  if (f) {
+    fputs("plain text, not a container", f);
+    fclose(f);
+    st = storage_inspect_file(npath, &sum, NULL, NULL);
+    CHECK(st == STORAGE_ERR_BAD_MAGIC, "inspect: plain text => BAD_MAGIC");
+    unlink(npath);
+  }
+
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+  cleanup_path(path);
+}
+
+static void test_toolkit_read_versions(void) {
+  const char *path = "/tmp/edoc_test_rdver.edoc";
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc, c1, c2;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&c1, "first snapshot");
+  make_doc(&c2, "second snapshot, current");
+  storage_save(s, path, &c1, &meta);
+  storage_save(s, path, &c2, &meta);
+  storage_session_close(s);
+
+  StorageVersion *vers = NULL;
+  size_t n = 0;
+  StorageStatus st = storage_read_versions(path, &vers, &n);
+  CHECK(st == STORAGE_OK && n == 2, "read_versions: both snapshots found");
+  if (st == STORAGE_OK && n == 2) {
+    CHECK(vers[0].doc.len == c1.len &&
+              memcmp(vers[0].doc.data, c1.data, c1.len) == 0,
+          "read_versions: oldest entry matches v1 bytes");
+    CHECK(strcmp(vers[1].name, "v2") == 0,
+          "read_versions: auto-name carried through");
+  }
+  storage_versions_free(vers, n);
+
+  bytebuffer_free(&c1);
+  bytebuffer_free(&c2);
+  cleanup_path(path);
+}
+
+static void test_toolkit_recovery_report(void) {
+  const char *path = "/tmp/edoc_test_recreport.edoc";
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc, base, edit;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  make_doc(&base, "saved baseline");
+  storage_save(s, path, &base, &meta);
+
+  StorageRecoveryReport rep;
+  CHECK(storage_recovery_report(path, &rep) == STORAGE_OK,
+        "recovery_report: succeeds on clean file");
+  CHECK(!rep.journal_candidate && !rep.autosave_exists,
+        "recovery_report: nothing pending on clean file");
+
+  make_doc(&edit, "baseline plus unsaved work");
+  storage_journal_append(s, "insert", &edit);
+  storage_session_close(s); /* crash simulation: close without save */
+
+  CHECK(storage_recovery_report(path, &rep) == STORAGE_OK,
+        "recovery_report: reads journaled state");
+  CHECK(rep.journal_candidate && rep.journal_doc.len == edit.len &&
+            memcmp(rep.journal_doc.data, edit.data, edit.len) == 0,
+        "recovery_report: journal tail matches pending edit");
+  bytebuffer_free(&rep.journal_doc);
+
+  s = NULL;
+  storage_session_open(path, &s, &doc, &meta, &res);
+  bytebuffer_free(&doc);
+  sleep(1); /* guarantee mtime separation from the explicit save */
+  bytebuffer_free(&edit); /* release pre-reuse contents */
+  make_doc(&edit, "autosaved progress");
+  storage_mark_dirty(s);
+  storage_autosave_tick(s, &edit, &meta, 5000);
+  storage_session_close(s);
+  CHECK(storage_recovery_report(path, &rep) == STORAGE_OK &&
+                rep.autosave_exists && rep.autosave_newer_than_main,
+        "recovery_report: fresh autosave flagged newer than main");
+  bytebuffer_free(&rep.journal_doc);
+  bytebuffer_free(&base);
+  bytebuffer_free(&edit);
+  cleanup_path(path);
+}
+
+/* ===================================================================== *
+ * W2: edoc CLI end-to-end roundtrips (system()-driven; binary is built
+ * by the `test` target). Property: import(export(f)) and export(import)
+ * preserve bytes exactly, across empty / unicode / ~10 MB documents.
+ * ===================================================================== */
+
+static int run_cli(char *const args[]) {
+  pid_t pid = fork();
+  if (pid < 0)
+    return -1;
+  if (pid == 0) {
+    execv("./build/edoc", args); /* cmd unused: argv[0] carries it */
+    _exit(127);
+  }
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static bool files_equal(const char *a, const char *b) {
+  ByteBuffer ba, bb;
+  bool eq = false;
+  if (read_whole_file_public(a, &ba) == STORAGE_OK &&
+      read_whole_file_public(b, &bb) == STORAGE_OK) {
+    eq = ba.len == bb.len &&
+         (ba.len == 0 || memcmp(ba.data, bb.data, ba.len) == 0);
+  }
+  bytebuffer_free(&ba);
+  bytebuffer_free(&bb);
+  return eq;
+}
+
+static void write_text_file(const char *path, const void *data, size_t len) {
+  FILE *f = fopen(path, "wb");
+  CHECK(f != NULL, "cli roundtrip: can write source text");
+  if (!f)
+    return;
+  if (len)
+    fwrite(data, 1, len, f);
+  fclose(f);
+}
+
+static void test_cli_roundtrips(void) {
+  unlink("/tmp/edoc_cli_r1.edoc");
+  unlink("/tmp/edoc_cli_r2.edoc");
+  unlink("/tmp/edoc_cli_r3.edoc");
+
+  { /* plain ASCII */
+    write_text_file("/tmp/edoc_cli_a.txt", "hello container\n", 16);
+    char *i1[] = {"edoc", "import", "/tmp/edoc_cli_a.txt",
+                  "/tmp/edoc_cli_r1.edoc", NULL};
+    CHECK(run_cli(i1) == 0, "cli: import ascii exits 0");
+    char *e1[] = {"edoc", "export", "/tmp/edoc_cli_r1.edoc",
+                  "/tmp/edoc_cli_out.txt", NULL};
+    CHECK(run_cli(e1) == 0, "cli: export ascii exits 0");
+    CHECK(files_equal("/tmp/edoc_cli_a.txt", "/tmp/edoc_cli_out.txt"),
+          "cli: ascii roundtrip byte-equal");
+    char *v1[] = {"edoc", "verify", "/tmp/edoc_cli_r1.edoc", NULL};
+    CHECK(run_cli(v1) == 0, "cli: verify imported container exits 0");
+    unlink("/tmp/edoc_cli_a.txt");
+    unlink("/tmp/edoc_cli_out.txt");
+    cleanup_path("/tmp/edoc_cli_r1.edoc");
+  }
+
+  { /* unicode body incl. emoji + combining marks */
+    static const char uni[] = "héllo wörld ✓ 日本語 🎉\n\ttabbed\r\n";
+    write_text_file("/tmp/edoc_cli_u.txt", uni, sizeof(uni) - 1);
+    char *i2[] = {"edoc", "import", "/tmp/edoc_cli_u.txt",
+                  "/tmp/edoc_cli_r2.edoc", NULL};
+    char *e2[] = {"edoc", "export", "/tmp/edoc_cli_r2.edoc",
+                  "/tmp/edoc_cli_out2.txt", NULL};
+    CHECK(run_cli(i2) == 0 && run_cli(e2) == 0,
+          "cli: unicode import/export exit 0");
+    CHECK(files_equal("/tmp/edoc_cli_u.txt", "/tmp/edoc_cli_out2.txt"),
+          "cli: unicode roundtrip byte-equal");
+    unlink("/tmp/edoc_cli_u.txt");
+    unlink("/tmp/edoc_cli_out2.txt");
+    cleanup_path("/tmp/edoc_cli_r2.edoc");
+  }
+
+  { /* ~10 MB pseudo-random deterministic body */
+    enum { BIG = 10 * 1024 * 1024 };
+    char *big = malloc(BIG);
+    CHECK(big != NULL, "cli: alloc 10MB body");
+    if (big) {
+      uint32_t x = 0x12345678u;
+      for (int i = 0; i < BIG; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        big[i] = (char)(x & 0xFF);
+      }
+      write_text_file("/tmp/edoc_cli_big.txt", big, BIG);
+      free(big);
+      char *i3[] = {"edoc", "import", "/tmp/edoc_cli_big.txt",
+                    "/tmp/edoc_cli_r3.edoc", NULL};
+      char *e3[] = {"edoc", "export", "/tmp/edoc_cli_r3.edoc",
+                    "/tmp/edoc_cli_out3.txt", NULL};
+      int rc_i = run_cli(i3);
+      int rc_e = run_cli(e3);
+      CHECK(rc_i == 0 && rc_e == 0, "cli: 10MB import/export exit 0");
+      CHECK(files_equal("/tmp/edoc_cli_big.txt", "/tmp/edoc_cli_out3.txt"),
+            "cli: 10MB roundtrip byte-equal");
+      unlink("/tmp/edoc_cli_big.txt");
+      unlink("/tmp/edoc_cli_out3.txt");
+      cleanup_path("/tmp/edoc_cli_r3.edoc");
+    }
+  }
+
+  { /* import refuses to clobber without --force */
+    write_text_file("/tmp/edoc_cli_c.txt", "x", 1);
+    char *i4[] = {"edoc", "import", "/tmp/edoc_cli_c.txt",
+                  "/tmp/edoc_cli_c.edoc", NULL};
+    CHECK(run_cli(i4) == 0, "cli: initial import ok");
+    CHECK(run_cli(i4) == 3, "cli: re-import without --force fails");
+    char *i5[] = {"edoc",       "import", "/tmp/edoc_cli_c.txt",
+                  "--force", "/tmp/edoc_cli_c.edoc", NULL};
+    CHECK(run_cli(i5) == 0, "cli: re-import with --force ok");
+    unlink("/tmp/edoc_cli_c.txt");
+    cleanup_path("/tmp/edoc_cli_c.edoc");
+  }
+}
+
+/* ===================================================================== *
+ * W2 hardening: adversarial CLI battery — the cases large products get
+ * burned by. Boundary bodies (empty / NUL-laden / no-newline), a full
+ * exit-code matrix, hostile argument shapes, and self-destructive
+ * invocations.
+ * ===================================================================== */
+
+static void test_cli_adversarial(void) {
+  /* --- boundary bodies -------------------------------------------- */
+  { /* zero-byte document: legal UTF-8 body of length 0 */
+    write_text_file("/tmp/adv_empty.txt", "", 0);
+    unlink("/tmp/adv_empty.edoc");
+    unlink("/tmp/adv_empty_out.txt");
+    char *i[] = {"edoc", "import", "/tmp/adv_empty.txt",
+                 "/tmp/adv_empty.edoc", NULL};
+    char *e[] = {"edoc", "export", "/tmp/adv_empty.edoc",
+                 "/tmp/adv_empty_out.txt", NULL};
+    char *v[] = {"edoc", "verify", "/tmp/adv_empty.edoc", NULL};
+    CHECK(run_cli(i) == 0, "adv: import empty body exits 0");
+    CHECK(run_cli(v) == 0, "adv: verify empty container exits 0");
+    CHECK(run_cli(e) == 0, "adv: export empty exits 0");
+    CHECK(files_equal("/tmp/adv_empty.txt", "/tmp/adv_empty_out.txt"),
+          "adv: empty roundtrip byte-equal");
+    cleanup_path("/tmp/adv_empty.edoc");
+    unlink("/tmp/adv_empty.txt");
+    unlink("/tmp/adv_empty_out.txt");
+  }
+
+  { /* NUL bytes and control characters inside the body */
+    static const char nul_body[] = {'a', '\0', '\0', 'b', '\n', '\0',
+                                    '\t', 0x01, 0x7f, 'z'};
+    write_text_file("/tmp/adv_nul.txt", nul_body, sizeof(nul_body));
+    unlink("/tmp/adv_nul.edoc");
+    unlink("/tmp/adv_nul_out.txt");
+    char *i[] = {"edoc", "import", "/tmp/adv_nul.txt",
+                 "/tmp/adv_nul.edoc", NULL};
+    char *e[] = {"edoc", "export", "/tmp/adv_nul.edoc",
+                 "/tmp/adv_nul_out.txt", NULL};
+    CHECK(run_cli(i) == 0 && run_cli(e) == 0,
+          "adv: NUL-laden body import/export exit 0");
+    CHECK(files_equal("/tmp/adv_nul.txt", "/tmp/adv_nul_out.txt"),
+          "adv: NUL bytes survive roundtrip byte-exact");
+    cleanup_path("/tmp/adv_nul.edoc");
+    unlink("/tmp/adv_nul.txt");
+    unlink("/tmp/adv_nul_out.txt");
+  }
+
+  { /* one enormous line, no newline anywhere */
+    enum { LINE = 512 * 1024 };
+    char *blob = malloc(LINE);
+    CHECK(blob != NULL, "adv: alloc huge-line body");
+    if (blob) {
+      memset(blob, 'Q', LINE);
+      write_text_file("/tmp/adv_line.txt", blob, LINE);
+      free(blob);
+      unlink("/tmp/adv_line.edoc");
+      unlink("/tmp/adv_line_out.txt");
+      char *i[] = {"edoc", "import", "/tmp/adv_line.txt",
+                   "/tmp/adv_line.edoc", NULL};
+      char *e[] = {"edoc", "export", "/tmp/adv_line.edoc",
+                   "/tmp/adv_line_out.txt", NULL};
+      CHECK(run_cli(i) == 0 && run_cli(e) == 0,
+            "adv: single 512KB line import/export exit 0");
+      CHECK(files_equal("/tmp/adv_line.txt", "/tmp/adv_line_out.txt"),
+            "adv: newline-free roundtrip byte-equal");
+      cleanup_path("/tmp/adv_line.edoc");
+      unlink("/tmp/adv_line.txt");
+      unlink("/tmp/adv_line_out.txt");
+    }
+  }
+
+  /* --- export overwrites stale longer output ----------------------- */
+  {
+    write_text_file("/tmp/adv_s.txt", "tiny", 4);
+    unlink("/tmp/adv_s.edoc");
+    char *i[] = {"edoc", "import", "/tmp/adv_s.txt", "/tmp/adv_s.edoc",
+                 NULL};
+    run_cli(i);
+    write_text_file("/tmp/adv_stale_out.txt",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 40);
+    char *e[] = {"edoc", "export", "/tmp/adv_s.edoc",
+                 "/tmp/adv_stale_out.txt", NULL};
+    CHECK(run_cli(e) == 0, "adv: export over stale output exits 0");
+    CHECK(files_equal("/tmp/adv_s.txt", "/tmp/adv_stale_out.txt"),
+          "adv: stale output fully replaced (no residue)");
+    unlink("/tmp/adv_s.txt");
+    unlink("/tmp/adv_stale_out.txt");
+    cleanup_path("/tmp/adv_s.edoc");
+  }
+
+  /* --- exit-code matrix & hostile args ----------------------------- */
+  {
+    write_text_file("/tmp/adv_plain.txt", "not a container", 15);
+    char *e_missing[] = {"edoc", "export", NULL};
+    CHECK(run_cli(e_missing) == 1, "adv: export no args => 1");
+    char *e_extra[] = {"edoc", "export", "a", "b", "c", NULL};
+    CHECK(run_cli(e_extra) == 1, "adv: export extra positional => 1");
+    char *e_v0[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v", "0",
+                    "/tmp/x.out", NULL};
+    CHECK(run_cli(e_v0) == 1, "adv: export -v 0 => usage 1");
+    char *e_vjunk[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v",
+                       "abc", "/tmp/x.out", NULL};
+    CHECK(run_cli(e_vjunk) == 1,
+          "adv: export -v non-numeric => usage 1");
+    char *e_both[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v", "1",
+                      "--name", "v1", "/tmp/x.out", NULL};
+    CHECK(run_cli(e_both) == 1,
+          "adv: both selectors rejected (was silent name-wins)");
+    char *e_vtail[] = {"edoc", "export", "/tmp/adv_plain.txt",
+                       "/tmp/x.out", "-v", NULL};
+    CHECK(run_cli(e_vtail) == 1, "adv: dangling -v => usage 1");
+
+    char *e_nf[] = {"edoc", "export", "/tmp/definitely_missing.edoc",
+                    "/tmp/x.out", NULL};
+    CHECK(run_cli(e_nf) == 3, "adv: export missing file => 3");
+    char *e_badmagic[] = {"edoc", "export", "/tmp/adv_plain.txt",
+                          "/tmp/x.out", NULL};
+    CHECK(run_cli(e_badmagic) == 3,
+          "adv: export plain-text-as-container => 3");
+    char *h_bad[] = {"edoc", "history", "/tmp/adv_plain.txt", NULL};
+    CHECK(run_cli(h_bad) == 3, "adv: history on garbage => 3");
+    char *d_dir[] = {"edoc", "dump", "/tmp", NULL};
+    CHECK(run_cli(d_dir) == 3, "adv: dump a directory => 3, no crash");
+    char *v_dir[] = {"edoc", "verify", "/tmp", NULL};
+    CHECK(run_cli(v_dir) == 3, "adv: verify a directory => 3");
+    char *i_missing_txt[] = {"edoc", "import", "/tmp/no_such_src.txt",
+                             "/tmp/adv_x.edoc", NULL};
+    CHECK(run_cli(i_missing_txt) == 3,
+          "adv: import missing source => 3");
+
+    /* CI-caught class: non-regular inputs must fail cleanly everywhere */
+    char *d_devnull[] = {"edoc", "dump", "/dev/null", NULL};
+    CHECK(run_cli(d_devnull) == 3, "adv: dump /dev/null => 3");
+    char *v_devnull[] = {"edoc", "verify", "/dev/null", NULL};
+    CHECK(run_cli(v_devnull) == 3, "adv: verify /dev/null => 3");
+    char *e_devnull[] = {"edoc", "export", "/dev/null", "/tmp/x.out",
+                         NULL};
+    CHECK(run_cli(e_devnull) == 3, "adv: export from /dev/null => 3");
+    write_text_file("/tmp/adv_src_ok.txt", "x", 1);
+    char *i_devnull[] = {"edoc", "import", "/dev/null",
+                         "/tmp/adv_dn.edoc", NULL};
+    CHECK(run_cli(i_devnull) == 3, "adv: import from /dev/null => 3");
+    unlink("/tmp/adv_src_ok.txt");
+
+    /* directory as import source and as export destination */
+    char *i_dir[] = {"edoc", "import", "/tmp", "/tmp/adv_dir.edoc",
+                     NULL};
+    CHECK(run_cli(i_dir) == 3, "adv: import from a directory => 3");
+    write_text_file("/tmp/adv_eout_src.txt", "y", 1);
+    char *e_outdir[] = {"edoc", "export", "/tmp/adv_eout_src.txt",
+                        "/tmp", NULL};
+    CHECK(run_cli(e_outdir) == 3,
+          "adv: export into a directory => 3");
+    unlink("/tmp/adv_eout_src.txt");
+
+    /* recover is a report: quiet even for nonsense paths */
+    char *r_none[] = {"edoc", "recover", "/tmp/nowhere/never.edoc", NULL};
+    CHECK(run_cli(r_none) == 0,
+          "adv: recover on absent path reports cleanly (exit 0)");
+    unlink("/tmp/adv_plain.txt");
+    unlink("/tmp/x.out");
+  }
+
+  /* --- import must never destroy its own source -------------------- */
+  {
+    write_text_file("/tmp/adv_self.txt", "precious source", 15);
+    char *self[] = {"edoc", "import", "/tmp/adv_self.txt",
+                    "/tmp/adv_self.txt", "--force", NULL};
+    CHECK(run_cli(self) == 3,
+          "adv: import src==dst refused with --force too");
+    ByteBuffer check;
+    bool intact = read_whole_file_public("/tmp/adv_self.txt", &check) ==
+                      STORAGE_OK &&
+                  check.len == 15;
+    bytebuffer_free(&check);
+    CHECK(intact, "adv: source file survived the refused self-import");
+    unlink("/tmp/adv_self.txt");
+  }
+
+  /* --- idempotent force-import keeps payload stable ------------------ */
+  {
+    write_text_file("/tmp/adv_idem.txt", "stable payload\n", 15);
+    unlink("/tmp/adv_idem.edoc");
+    char *imp[] = {"edoc", "import", "/tmp/adv_idem.txt",
+                   "/tmp/adv_idem.edoc", NULL};
+    char *impf[] = {"edoc",       "import", "/tmp/adv_idem.txt",
+                    "--force", "/tmp/adv_idem.edoc", NULL};
+    char *exp[] = {"edoc", "export", "/tmp/adv_idem.edoc",
+                   "/tmp/adv_idem_out.txt", NULL};
+    CHECK(run_cli(imp) == 0 && run_cli(impf) == 0 &&
+              run_cli(exp) == 0,
+          "adv: repeated force-import chain exits 0");
+    CHECK(files_equal("/tmp/adv_idem.txt", "/tmp/adv_idem_out.txt"),
+          "adv: payload stable across force-reimport");
+    unlink("/tmp/adv_idem.txt");
+    unlink("/tmp/adv_idem_out.txt");
+    cleanup_path("/tmp/adv_idem.edoc");
+  }
+}
+
+/* ===================================================================== *
+ * W2 consistency matrix: legacy-file behaviors, per-version export
+ * fidelity, selector edge cases, verify exit-code map, hostile-name
+ * imports, and the introspection summary contract on early errors.
+ * ===================================================================== */
+
+/* Builds a legacy-shaped container (no VERSIONS section) by promoting
+   an autosave image, mirroring pre-history files found in the wild. */
+static bool make_legacy_container(const char *path) {
+  char asp[512];
+  cleanup_path(path);
+  StorageSession *s = NULL;
+  ByteBuffer doc;
+  StorageMetadata meta;
+  StorageOpenResult res;
+  if (storage_session_open(path, &s, &doc, &meta, &res) != STORAGE_OK)
+    return false;
+  bytebuffer_free(&doc);
+  make_doc(&doc, "legacy body without history");
+  storage_mark_dirty(s);
+  bool ok = storage_autosave_tick(s, &doc, &meta, 1000);
+  storage_session_close(s);
+  bytebuffer_free(&doc);
+  snprintf(asp, sizeof(asp), "%s.autosave", path);
+  return ok && rename(asp, path) == 0;
+}
+
+static void test_consistency_matrix(void) {
+  /* --- legacy container across every relevant command --------------- */
+  const char *legacy = "/tmp/mx_legacy.edoc";
+  CHECK(make_legacy_container(legacy), "mx: legacy container created");
+  {
+    char *h[] = {"edoc", "history", (char *)legacy, NULL};
+    CHECK(run_cli(h) == 0,
+          "mx: history on legacy file exits 0 (no versions)");
+    char *d[] = {"edoc", "dump", (char *)legacy, NULL};
+    CHECK(run_cli(d) == 0,
+          "mx: dump on legacy file exits 0 (two sections)");
+    char *e[] = {"edoc", "export", (char *)legacy,
+                 "/tmp/mx_legacy_out.txt", NULL};
+    CHECK(run_cli(e) == 0, "mx: export document from legacy exits 0");
+    ByteBuffer out;
+    bool ok = read_whole_file_public("/tmp/mx_legacy_out.txt", &out) ==
+                  STORAGE_OK &&
+              out.len == strlen("legacy body without history");
+    bytebuffer_free(&out);
+    CHECK(ok, "mx: legacy document bytes exported intact");
+    char *vsel[] = {"edoc", "export", (char *)legacy, "-v",
+                    "1",     "/tmp/mx_v1.txt", NULL};
+    CHECK(run_cli(vsel) == 3,
+          "mx: version select on history-less file => 3");
+    unlink("/tmp/mx_legacy_out.txt");
+    unlink("/tmp/mx_v1.txt");
+    cleanup_path(legacy);
+  }
+
+  /* --- every stored version exports byte-exact; unicode names ------- */
+  {
+    const char *p = "/tmp/mx_versions.edoc";
+    cleanup_path(p);
+    StorageSession *s = NULL;
+    ByteBuffer doc;
+    StorageMetadata meta;
+    StorageOpenResult res;
+    storage_session_open(p, &s, &doc, &meta, &res);
+    bytebuffer_free(&doc);
+    enum { NV = 5 };
+    ByteBuffer keep[NV];
+    for (int i = 0; i < NV; i++) {
+      char body[64];
+      snprintf(body, sizeof(body), "payload of revision %d", i + 1);
+      make_doc(&keep[i], body);
+      storage_save(s, p, &keep[i], &meta);
+    }
+    CHECK(storage_history_rename(s, NV - 2, "α-version-β"),
+          "mx: unicode rename accepted");
+    storage_save(s, p, &keep[NV - 1], &meta); /* dedupe persists rename */
+    storage_session_close(s);
+
+    for (int id = 1; id <= NV; id++) {
+      char sel[16], outp[64];
+      snprintf(sel, sizeof(sel), "%d", id);
+      snprintf(outp, sizeof(outp), "/tmp/mx_v%d.out", id);
+      char *ex[] = {"edoc", "export", (char *)p, "-v", sel, outp, NULL};
+      CHECK(run_cli(ex) == 0, "mx: export -v <id> exits 0");
+      char exp[64];
+      snprintf(exp, sizeof(exp), "payload of revision %d", id);
+      ByteBuffer out;
+      bool eq = read_whole_file_public(outp, &out) == STORAGE_OK &&
+                out.len == strlen(exp) &&
+                memcmp(out.data, exp, out.len) == 0;
+      bytebuffer_free(&out);
+      CHECK(eq, "mx: exported snapshot matches stored revision bytes");
+      unlink(outp);
+    }
+    char *en[] = {"edoc",       "export",      (char *)p, "--name",
+                  "α-version-β", "/tmp/mx_uni.out", NULL};
+    CHECK(run_cli(en) == 0, "mx: export by unicode name exits 0");
+    ByteBuffer uo;
+    bool ueq = read_whole_file_public("/tmp/mx_uni.out", &uo) ==
+                   STORAGE_OK &&
+               uo.len == keep[1].len &&
+               memcmp(uo.data, keep[1].data, uo.len) == 0;
+    bytebuffer_free(&uo);
+    CHECK(ueq, "mx: unicode-named version exports its own bytes");
+    unlink("/tmp/mx_uni.out");
+
+    for (int i = 0; i < NV; i++)
+      bytebuffer_free(&keep[i]);
+    cleanup_path(p);
+  }
+
+  /* --- verify exit-code map for structural rejections ---------------- */
+  {
+    write_text_file("/tmp/mx_plain.txt", "nope", 4);
+
+    ByteBuffer img;
+    bytebuffer_init(&img);
+    put_le32(&img, 0x434F4445u);
+    put_le32(&img, 7u); /* future format version */
+    put_le64(&img, 1700000000);
+    append_edoc_footer(&img, 1); /* footer crc over header only */
+    write_text_file("/tmp/mx_future.edoc", img.data, img.len);
+    bytebuffer_free(&img);
+
+    char *v_bad[] = {"edoc", "verify", "/tmp/mx_plain.txt", NULL};
+    CHECK(run_cli(v_bad) == 3, "mx: verify non-container => 3");
+    char *v_fut[] = {"edoc", "verify", "/tmp/mx_future.edoc", NULL};
+    CHECK(run_cli(v_fut) == 3,
+          "mx: verify future format version => 3");
+    unlink("/tmp/mx_plain.txt");
+    unlink("/tmp/mx_future.edoc");
+  }
+
+  /* --- very long source filename -> capped title, valid output ------- */
+  {
+    char longname[600], src[700];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    snprintf(src, sizeof(src), "/tmp/%s.txt", longname);
+    FILE *f = fopen(src, "wb");
+    if (f) {
+      fputs("long name body", f);
+      fclose(f);
+      cleanup_path("/tmp/mx_long.edoc");
+      char *i[] = {"edoc", "import", src, "/tmp/mx_long.edoc", NULL};
+      CHECK(run_cli(i) == 0,
+            "mx: import with ~600-char filename succeeds");
+      char *vv[] = {"edoc", "verify", "/tmp/mx_long.edoc", NULL};
+      CHECK(run_cli(vv) == 0,
+            "mx: container from long-name import verifies");
+      unlink(src);
+      cleanup_path("/tmp/mx_long.edoc");
+    }
+  }
+
+  /* --- recovery report goes quiet after journal discard -------------- */
+  {
+    const char *p = "/tmp/mx_rec.edoc";
+    cleanup_path(p);
+    StorageSession *s = NULL;
+    ByteBuffer doc, edit;
+    StorageMetadata meta;
+    StorageOpenResult res;
+    storage_session_open(p, &s, &doc, &meta, &res);
+    bytebuffer_free(&doc);
+    make_doc(&doc, "base");
+    storage_save(s, p, &doc, &meta);
+    make_doc(&edit, "pending");
+    storage_journal_append(s, "insert", &edit);
+    bytebuffer_free(&edit);
+    storage_recovery_discard(s); /* user chose Discard */
+    storage_session_close(s);
+    bytebuffer_free(&doc);
+
+    StorageRecoveryReport rep;
+    CHECK(storage_recovery_report(p, &rep) == STORAGE_OK &&
+              !rep.journal_candidate,
+          "mx: discarded journal no longer reported pending");
+    bytebuffer_free(&rep.journal_doc);
+    cleanup_path(p);
+  }
+
+  /* --- toolkit API contracts on crafted/early-error inputs ----------- */
+  {
+    /* container with METADATA but no DOCUMENT => read_document fails */
+    ByteBuffer img;
+    bytebuffer_init(&img);
+    put_le32(&img, 0x434F4445u);
+    put_le32(&img, 1u);
+    put_le64(&img, 1700000000);
+    put_le32(&img, STORAGE_SECTION_METADATA);
+    put_le64(&img, 0u);
+    put_le32(&img, t_crc32((const uint8_t *)"", 0));
+    append_edoc_footer(&img, 1);
+    write_text_file("/tmp/mx_nodoc.edoc", img.data, img.len);
+    bytebuffer_free(&img);
+
+    ByteBuffer body;
+    CHECK(storage_read_document("/tmp/mx_nodoc.edoc", &body) ==
+              STORAGE_ERR_TRUNCATED,
+          "mx: read_document without DOCUMENT section => TRUNCATED");
+
+    /* inspect summary contract on structural early-outs */
+    write_text_file("/tmp/mx_short.edoc", "hi!", 3);
+    StorageInspectSummary sum;
+    InspectCtx ctx = {0, true, false, false, false};
+    StorageStatus st =
+        storage_inspect_file("/tmp/mx_short.edoc", &sum, NULL, NULL);
+    CHECK(st == STORAGE_ERR_TRUNCATED && sum.sections_walked == 0 &&
+              sum.file_size == 3,
+          "mx: below-minimum file => TRUNCATED, size reported");
+    write_text_file("/tmp/mx_notc.edoc",
+                    "plain text long enough to pass the length gate", 46);
+    sum.file_size = 0;
+    ctx.seen = 0;
+    st = storage_inspect_file("/tmp/mx_notc.edoc", &sum, inspect_collect,
+                              &ctx);
+    CHECK(st == STORAGE_ERR_BAD_MAGIC && ctx.seen == 0 &&
+              sum.sections_walked == 0 && sum.file_size == 46 &&
+              sum.format_version == 0,
+          "mx: BAD_MAGIC emits nothing; size populated, version untouched");
+    unlink("/tmp/mx_short.edoc");
+    unlink("/tmp/mx_notc.edoc");
+  }
+}
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -993,7 +1762,14 @@ int main(void) {
   test_save_as_rebinds_siblings();
   test_version_browser_flow();
   test_fuzz_regressions();
+  test_toolkit_inspect();
+  test_toolkit_read_versions();
+  test_toolkit_recovery_report();
+  test_cli_roundtrips();
+  test_cli_adversarial();
+  test_consistency_matrix();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+

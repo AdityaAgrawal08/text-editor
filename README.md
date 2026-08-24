@@ -21,19 +21,42 @@ sudo apt install libsdl2-dev libfreetype6-dev
 ### Compile
 
 ```bash
-make          # optimised build  →  build/editor
+make          # optimised build  →  build/editor + build/edoc
 make debug    # ASan + UBSan     →  build/editor
-make test     # storage tests    →  build/test_storage
+make test     # full suite       →  build/test_storage (runs it)
+make fuzz N=1000000 SEED=42   # parser fuzz campaign under ASan+UBSan
 ```
 
 Header dependencies are tracked automatically (`-MMD -MP`): editing any
 header in `include/` rebuilds exactly the objects that include it.
 
+## The edoc toolkit
+
+`.edoc` files are not a private format — a standalone CLI ships with
+the editor and works without any SDL/FreeType dependency:
+
+```bash
+build/edoc verify file.edoc              # checksum audit (exit 2 = corrupt)
+build/edoc dump file.edoc                # per-section table, pinpoints damage
+build/edoc history file.edoc             # newest-first version list
+build/edoc export file.edoc out.txt      # plain UTF-8 out (-v ID / --name X)
+build/edoc import text.txt file.edoc     # wrap text into a container
+build/edoc recover file.edoc             # report pending journal/autosave
+```
+
+Exit codes: `0` ok · `1` usage · `2` verification failed · `3` I/O or
+format error. The binary container format is fully specified in
+[`docs/EDOC_SPEC.md`](docs/EDOC_SPEC.md).
+
 ### Continuous integration
 
 Every push is built on GitHub Actions with both **gcc** and **clang**:
-a release build with `-Werror`, plus the storage test suite and a full
-editor build under **ASan + UBSan**.
+a release build with `-Werror`, plus the storage test suite, an editor
+build under **ASan + UBSan**, and a 30k-execution fuzz smoke run.
+
+The parsers are continuously fuzzed (dumb + coverage-guided libFuzzer);
+campaign evidence and locked crash regressions live in
+`Implementation.md`.
 
 ### Run
 
@@ -53,20 +76,25 @@ falls back to DejaVu Sans Mono at the system font path.
 text-editor/
 ├── Makefile
 ├── README.md
+├── Implementation.md               ← milestone plan & verification evidence
 ├── assets/
-│   └── font.ttf                  ← monospace font (required)
+│   └── font.ttf                    ← monospace font (required)
+├── docs/
+│   └── EDOC_SPEC.md                ← binary format specification
 ├── include/
-│   ├── storage.h                 ← persistence layer API
-│   ├── language.h                ← LanguageRegistry API
-│   ├── formatter.h               ← FormattingEngine API
-│   └── save_pipeline.h           ← SavePipeline API
+│   ├── storage.h                   ← persistence layer API
+│   ├── language.h                  ← LanguageRegistry API
+│   ├── formatter.h                 ← FormattingEngine API
+│   └── save_pipeline.h             ← SavePipeline API
 └── src/
-    ├── editor.c                  ← rendering, input, editor core
-    ├── storage.c                 ← EDOC format, atomic save, journal, autosave, backups
-    ├── language.c                ← language detection (extension, shebang, content)
-    ├── formatter.c               ← external formatter runner
-    ├── save_pipeline.c           ← 6-stage pre-write pipeline
-    └── test_storage.c            ← 34 storage layer tests
+    ├── editor.c                    ← rendering, input, editor core
+    ├── storage.c                   ← EDOC format, atomic save, journal, autosave, backups
+    ├── language.c                  ← language detection (extension, shebang, content)
+    ├── formatter.c                 ← external formatter runner
+    ├── save_pipeline.c             ← 6-stage pre-write pipeline
+    ├── edoc_cli.c                  ← standalone `edoc` toolkit
+    ├── fuzz_harness.c              ← parser fuzzing (dumb + libFuzzer entry)
+    └── test_storage.c              ← storage/toolkit/CLI test suite
 ```
 
 ---

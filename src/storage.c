@@ -243,26 +243,33 @@ static StorageStatus read_whole_file(const char *path, ByteBuffer *out) {
   if (!f)
     return STORAGE_ERR_NOT_FOUND;
 
-  if (fseek(f, 0, SEEK_END) != 0) {
+  /* Regular files only: on glibc, fopen() succeeds for directories and
+     fstat-based sizing is authoritative where fseek/ftell heuristics
+     return garbage (CI caught a 2^63-byte allocation attempt). */
+  struct stat st;
+  if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
     fclose(f);
     return STORAGE_ERR_IO;
   }
-  long size = ftell(f);
-  if (size < 0) {
+  if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
     fclose(f);
     return STORAGE_ERR_IO;
   }
-  rewind(f);
 
   bytebuffer_init(out);
-  if (size > 0 && !bytebuffer_reserve(out, (size_t)size)) {
+  size_t size = (size_t)st.st_size;
+  if (size == 0) { /* empty regular file is valid input */
+    fclose(f);
+    return STORAGE_OK;
+  }
+  if (!bytebuffer_reserve(out, size)) {
     fclose(f);
     return STORAGE_ERR_NOMEM;
   }
 
   size_t total_read = 0;
-  while (total_read < (size_t)size) {
-    size_t r = fread(out->data + total_read, 1, (size_t)size - total_read, f);
+  while (total_read < size) {
+    size_t r = fread(out->data + total_read, 1, size - total_read, f);
     if (r == 0) {
       if (feof(f))
         break;
@@ -465,7 +472,7 @@ static StorageStatus parse_edoc_image(const uint8_t *data, size_t len,
     *out_history = NULL;
     *out_history_len = 0;
   }
-  if (len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE)
+  if (len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE || !data)
     return STORAGE_ERR_TRUNCATED;
 
   uint32_t magic = read_u32_le(data);
@@ -1452,8 +1459,172 @@ bool storage_history_dirty(const StorageSession *session) {
   return session ? session->hist_dirty : false;
 }
 
-const char *storage_status_string(StorageStatus status) {
-  switch (status) {
+/* ===================================================================== *
+ * Read-only toolkit API (see storage.h contract notes)
+ * ===================================================================== */
+
+StorageStatus storage_inspect_file(const char *path,
+                                   StorageInspectSummary *out_summary,
+                                   storage_section_iter_fn fn, void *user) {
+  if (!path || !out_summary)
+    return STORAGE_ERR_INVALID_ARG;
+  memset(out_summary, 0, sizeof(*out_summary));
+
+  ByteBuffer raw;
+  StorageStatus st = read_whole_file(path, &raw);
+  if (st != STORAGE_OK)
+    return st;
+  out_summary->file_size = raw.len;
+
+  if (raw.len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE || !raw.data) {
+    bytebuffer_free(&raw);
+    return STORAGE_ERR_TRUNCATED;
+  }
+
+  uint32_t magic = read_u32_le(raw.data);
+  if (magic != STORAGE_MAGIC) {
+    bytebuffer_free(&raw);
+    return STORAGE_ERR_BAD_MAGIC;
+  }
+  out_summary->format_version = read_u32_le(raw.data + 4);
+  if (out_summary->format_version != STORAGE_FORMAT_VERSION) {
+    bytebuffer_free(&raw);
+    return STORAGE_ERR_UNSUPPORTED_VERSION;
+  }
+  out_summary->header_created_at = read_u64_le(raw.data + 8);
+
+  size_t end = raw.len - FILE_FOOTER_SIZE; /* footer excluded from walk */
+  out_summary->section_count = read_u32_le(raw.data + end);
+  uint32_t stored_footer_crc = read_u32_le(raw.data + end + 4);
+  out_summary->footer_crc_ok =
+      (stored_footer_crc == crc32_compute(raw.data, end));
+
+  /* Walk as far as structurally safe; corruption shortens the walk
+     rather than aborting it, so tools can still report what exists. */
+  size_t off = FILE_HEADER_SIZE;
+  for (uint32_t i = 0; i < out_summary->section_count; i++) {
+    if ((size_t)(end - off) < SECTION_HEADER_SIZE) {
+      st = STORAGE_ERR_TRUNCATED;
+      break;
+    }
+    StorageSectionInfo info = {0};
+    info.type = read_u32_le(raw.data + off);
+    info.payload_len = read_u64_le(raw.data + off + 4);
+    info.payload_crc = read_u32_le(raw.data + off + 12);
+    off += SECTION_HEADER_SIZE;
+    info.payload_off = off;
+
+    if ((uint64_t)(end - off) < info.payload_len) {
+      st = STORAGE_ERR_TRUNCATED;
+      break;
+    }
+    info.crc_ok =
+        (crc32_compute(raw.data + off, (size_t)info.payload_len) ==
+         info.payload_crc);
+    off += (size_t)info.payload_len;
+
+    if (fn)
+      fn(&info, user);
+    out_summary->sections_walked++;
+  }
+
+  /* Status contract: early-stop wins first; otherwise OK demands BOTH
+     a valid whole-file CRC and every claimed section present. A sliced
+     file whose claimed-count happens to be 0 must not read as clean. */
+  if (st == STORAGE_OK && !out_summary->footer_crc_ok)
+    st = STORAGE_ERR_CORRUPT_CHECKSUM;
+  if (st == STORAGE_OK &&
+      out_summary->sections_walked != out_summary->section_count)
+    st = STORAGE_ERR_TRUNCATED;
+
+  bytebuffer_free(&raw);
+  return st;
+}
+
+StorageStatus storage_read_versions(const char *path,
+                                    StorageVersion **out_versions,
+                                    size_t *out_count) {
+  if (!path || !out_versions || !out_count)
+    return STORAGE_ERR_INVALID_ARG;
+  *out_versions = NULL;
+  *out_count = 0;
+
+  ByteBuffer raw, doc;
+  StorageMetadata meta;
+  StorageVersion *hist = NULL;
+  size_t hist_len = 0;
+  StorageStatus st = read_whole_file(path, &raw);
+  if (st != STORAGE_OK)
+    return st;
+  st = parse_edoc_image(raw.data, raw.len, &doc, &meta, &hist, &hist_len);
+  bytebuffer_free(&raw);
+  if (st != STORAGE_OK) {
+    history_free(hist, hist_len); /* parser leaves history caller-owned */
+    return st;
+  }
+  bytebuffer_free(&doc); /* body not requested */
+  *out_versions = hist;
+  *out_count = hist_len;
+  return STORAGE_OK;
+}
+
+void storage_versions_free(StorageVersion *versions, size_t count) {
+  history_free(versions, count);
+}
+
+StorageStatus storage_read_document(const char *path, ByteBuffer *out_doc) {
+  if (!path || !out_doc)
+    return STORAGE_ERR_INVALID_ARG;
+  bytebuffer_init(out_doc);
+
+  ByteBuffer raw;
+  StorageMetadata meta;
+  StorageStatus st = read_whole_file(path, &raw);
+  if (st != STORAGE_OK)
+    return st;
+  st = parse_edoc_image(raw.data, raw.len, out_doc, &meta, NULL, NULL);
+  bytebuffer_free(&raw);
+  if (st != STORAGE_OK)
+    bytebuffer_free(out_doc); /* parser owns cleanup only on its paths */
+  return st;
+}
+
+StorageStatus storage_recovery_report(const char *path,
+                                      StorageRecoveryReport *out_report) {
+  if (!path || !out_report)
+    return STORAGE_ERR_INVALID_ARG;
+  memset(out_report, 0, sizeof(*out_report));
+  bytebuffer_init(&out_report->journal_doc);
+
+  char sib[STORAGE_PATH_MAX];
+
+  derive_sibling_path(path, ".journal", sib, sizeof(sib));
+  ByteBuffer raw;
+  if (read_whole_file(sib, &raw) == STORAGE_OK) {
+    ByteBuffer tail;
+    bytebuffer_init(&tail);
+    if (journal_find_last_valid(raw.data, raw.len, &tail) == STORAGE_OK) {
+      out_report->journal_candidate = true;
+      bytebuffer_free(&out_report->journal_doc);
+      out_report->journal_doc = tail; /* ownership transfer */
+    } else {
+      bytebuffer_free(&tail);
+    }
+    bytebuffer_free(&raw);
+  } /* NOT_FOUND simply means no journal sibling */
+
+  derive_sibling_path(path, ".autosave", sib, sizeof(sib));
+  struct stat as_st, main_st;
+  bool autosave_exists = (stat(sib, &as_st) == 0);
+  bool main_exists = (stat(path, &main_st) == 0);
+  out_report->autosave_exists = autosave_exists;
+  out_report->autosave_newer_than_main =
+      autosave_exists && (!main_exists || as_st.st_mtime >= main_st.st_mtime);
+
+  return STORAGE_OK;
+}
+
+const char *storage_status_string(StorageStatus status) {  switch (status) {
   case STORAGE_OK:
     return "OK";
   case STORAGE_ERR_IO:
