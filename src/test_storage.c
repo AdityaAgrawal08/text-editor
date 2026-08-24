@@ -869,8 +869,6 @@ static StorageStatus read_whole_file_public(const char *path,
   return got == (size_t)sz ? STORAGE_OK : STORAGE_ERR_TRUNCATED;
 }
 
-#define FILE_HEADER_SIZE_PUB 16
-#define SECTION_HEADER_SIZE_PUB 16
 
 static void test_fuzz_regressions(void) {
   /* F2 (libFuzzer crash artifact): crafted VER1 record whose doc_len

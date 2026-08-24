@@ -31,9 +31,16 @@ StorageStatus fuzz_journal_scan(const uint8_t *data, size_t len);
 StorageStatus fuzz_history_parse(const uint8_t *data, size_t len, size_t *out_count);
 
 #define MAX_INPUT (64u * 1024u)
-#define SEED_PATH "/tmp/palimpsest_fuzz_seed.edoc"
 
 #ifndef LIBFUZZER
+
+/* Per-process seed workspace: parallel campaigns (CI matrix jobs, a
+   second terminal) must never race on the same temp files. */
+static char g_seed_path[128];
+static void seed_path_init(void) {
+  snprintf(g_seed_path, sizeof(g_seed_path), "/tmp/palimpsest_fuzz_%ld.edoc",
+           (long)getpid());
+}
 
 /* ------------------------------------------------------------------ *
  * Deterministic RNG (xorshift64*): same SEED => identical campaign
@@ -131,15 +138,15 @@ static void gen_history_seed(void) {
 
 static void remove_seeds(void) {
   char p[280];
-  snprintf(p, sizeof(p), "%s", SEED_PATH);
+  snprintf(p, sizeof(p), "%s", g_seed_path);
   unlink(p);
-  snprintf(p, sizeof(p), "%s.journal", SEED_PATH);
+  snprintf(p, sizeof(p), "%s.journal", g_seed_path);
   unlink(p);
-  snprintf(p, sizeof(p), "%s.autosave", SEED_PATH);
+  snprintf(p, sizeof(p), "%s.autosave", g_seed_path);
   unlink(p);
   for (int i = 0; i < STORAGE_MAX_BACKUPS; i++) {
     char bp[300];
-    snprintf(bp, sizeof(bp), "%s.bak.%d", SEED_PATH, i);
+    snprintf(bp, sizeof(bp), "%s.bak.%d", g_seed_path, i);
     unlink(bp);
   }
 }
@@ -152,7 +159,7 @@ static int gen_public_api_seeds(void) {
 
   remove_seeds();
 
-  if (storage_session_open(SEED_PATH, &s, &doc, &meta, &res) != STORAGE_OK)
+  if (storage_session_open(g_seed_path, &s, &doc, &meta, &res) != STORAGE_OK)
     return -1;
   bytebuffer_free(&doc);
   memset(&meta, 0, sizeof(meta));
@@ -163,23 +170,23 @@ static int gen_public_api_seeds(void) {
   const char *text1 = "int main() {\n    return 0;\n}\n";
   bytebuffer_init(&doc);
   bytebuffer_append(&doc, text1, strlen(text1));
-  if (storage_save(s, SEED_PATH, &doc, &meta) != STORAGE_OK) {
+  if (storage_save(s, g_seed_path, &doc, &meta) != STORAGE_OK) {
     bytebuffer_free(&doc);
     storage_session_close(s);
     return -1;
   }
-  g_seed_edoc = read_file_bytes(SEED_PATH);
+  g_seed_edoc = read_file_bytes(g_seed_path);
 
   const char *text2 = "int main(void) {\n    return 1;\n}\n";
   bytebuffer_free(&doc); /* release text1's buffer before reusing */
   bytebuffer_init(&doc);
   bytebuffer_append(&doc, text2, strlen(text2));
-  if (storage_save(s, SEED_PATH, &doc, &meta) != STORAGE_OK) {
+  if (storage_save(s, g_seed_path, &doc, &meta) != STORAGE_OK) {
     bytebuffer_free(&doc);
     storage_session_close(s);
     return -1;
   }
-  g_seed_edoc_hist = read_file_bytes(SEED_PATH);
+  g_seed_edoc_hist = read_file_bytes(g_seed_path);
   bytebuffer_free(&doc);
 
   /* Leave a non-empty journal behind: close without saving. */
@@ -191,7 +198,7 @@ static int gen_public_api_seeds(void) {
   storage_session_close(s);
 
   char jpath[300];
-  snprintf(jpath, sizeof(jpath), "%s.journal", SEED_PATH);
+  snprintf(jpath, sizeof(jpath), "%s.journal", g_seed_path);
   g_seed_journal = read_file_bytes(jpath);
 
   remove_seeds();
@@ -372,6 +379,7 @@ int main(int argc, char **argv) {
     n_execs = 1;
   g_rng = seed ? seed : 1;
 
+  seed_path_init();
   gen_history_seed();
   if (gen_public_api_seeds() != 0) {
     fprintf(stderr, "fatal: could not generate seed corpus\n");

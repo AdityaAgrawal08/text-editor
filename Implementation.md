@@ -105,6 +105,14 @@ Regression suite: 5 new tests (crasher bytes, valid-record guard,
   truncation-leak, wrapped payload_len, wrapped journal doc_len)
 make test: 0 failures · gcc/clang -Werror + _FORTIFY_SOURCE=2 clean
 Commits: 4eeb7b7 (infra+F1) · f3bcfe5 (F2-F4+regressions) — branch W1
+
+Hardening pass (verification round):
+  - seed workspace made per-process (was shared /tmp path -> parallel
+    campaigns raced); proven with 4 concurrent instances, zero leftovers
+  - CI gained a fuzz smoke step (30k execs per sanitizers job)
+  - dead macros removed; strict -Werror passes on gcc+clang x
+    standalone+libFuzzer modes; editor binary verified free of fuzz_
+    symbols (shim isolation); crasher replay + 100k guided runs clean
 ```
 
 ---

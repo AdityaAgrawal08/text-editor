@@ -33,3 +33,7 @@ jobs:
       - name: Build editor binary under ASan+UBSan
         if: matrix.mode == 'sanitizers'
         run: make debug CC=${{ matrix.cc }} WARN="-Wall -Wextra"
+
+      - name: Fuzz smoke run under ASan+UBSan
+        if: matrix.mode == 'sanitizers'
+        run: make fuzz N=30000 SEED=${{ github.run_id }} CC=${{ matrix.cc }}
