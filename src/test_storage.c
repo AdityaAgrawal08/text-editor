@@ -1201,7 +1201,7 @@ static void test_toolkit_recovery_report(void) {
  * preserve bytes exactly, across empty / unicode / ~10 MB documents.
  * ===================================================================== */
 
-static int run_cli(char *cmd, char *const args[]) {
+static int run_cli(char *const args[]) {
   pid_t pid = fork();
   if (pid < 0)
     return -1;
@@ -1247,14 +1247,14 @@ static void test_cli_roundtrips(void) {
     write_text_file("/tmp/edoc_cli_a.txt", "hello container\n", 16);
     char *i1[] = {"edoc", "import", "/tmp/edoc_cli_a.txt",
                   "/tmp/edoc_cli_r1.edoc", NULL};
-    CHECK(run_cli(NULL, i1) == 0, "cli: import ascii exits 0");
+    CHECK(run_cli(i1) == 0, "cli: import ascii exits 0");
     char *e1[] = {"edoc", "export", "/tmp/edoc_cli_r1.edoc",
                   "/tmp/edoc_cli_out.txt", NULL};
-    CHECK(run_cli(NULL, e1) == 0, "cli: export ascii exits 0");
+    CHECK(run_cli(e1) == 0, "cli: export ascii exits 0");
     CHECK(files_equal("/tmp/edoc_cli_a.txt", "/tmp/edoc_cli_out.txt"),
           "cli: ascii roundtrip byte-equal");
     char *v1[] = {"edoc", "verify", "/tmp/edoc_cli_r1.edoc", NULL};
-    CHECK(run_cli(NULL, v1) == 0, "cli: verify imported container exits 0");
+    CHECK(run_cli(v1) == 0, "cli: verify imported container exits 0");
     unlink("/tmp/edoc_cli_a.txt");
     unlink("/tmp/edoc_cli_out.txt");
     cleanup_path("/tmp/edoc_cli_r1.edoc");
@@ -1267,7 +1267,7 @@ static void test_cli_roundtrips(void) {
                   "/tmp/edoc_cli_r2.edoc", NULL};
     char *e2[] = {"edoc", "export", "/tmp/edoc_cli_r2.edoc",
                   "/tmp/edoc_cli_out2.txt", NULL};
-    CHECK(run_cli(NULL, i2) == 0 && run_cli(NULL, e2) == 0,
+    CHECK(run_cli(i2) == 0 && run_cli(e2) == 0,
           "cli: unicode import/export exit 0");
     CHECK(files_equal("/tmp/edoc_cli_u.txt", "/tmp/edoc_cli_out2.txt"),
           "cli: unicode roundtrip byte-equal");
@@ -1294,8 +1294,8 @@ static void test_cli_roundtrips(void) {
                     "/tmp/edoc_cli_r3.edoc", NULL};
       char *e3[] = {"edoc", "export", "/tmp/edoc_cli_r3.edoc",
                     "/tmp/edoc_cli_out3.txt", NULL};
-      int rc_i = run_cli(NULL, i3);
-      int rc_e = run_cli(NULL, e3);
+      int rc_i = run_cli(i3);
+      int rc_e = run_cli(e3);
       CHECK(rc_i == 0 && rc_e == 0, "cli: 10MB import/export exit 0");
       CHECK(files_equal("/tmp/edoc_cli_big.txt", "/tmp/edoc_cli_out3.txt"),
             "cli: 10MB roundtrip byte-equal");
@@ -1309,11 +1309,11 @@ static void test_cli_roundtrips(void) {
     write_text_file("/tmp/edoc_cli_c.txt", "x", 1);
     char *i4[] = {"edoc", "import", "/tmp/edoc_cli_c.txt",
                   "/tmp/edoc_cli_c.edoc", NULL};
-    CHECK(run_cli(NULL, i4) == 0, "cli: initial import ok");
-    CHECK(run_cli(NULL, i4) == 3, "cli: re-import without --force fails");
+    CHECK(run_cli(i4) == 0, "cli: initial import ok");
+    CHECK(run_cli(i4) == 3, "cli: re-import without --force fails");
     char *i5[] = {"edoc",       "import", "/tmp/edoc_cli_c.txt",
                   "--force", "/tmp/edoc_cli_c.edoc", NULL};
-    CHECK(run_cli(NULL, i5) == 0, "cli: re-import with --force ok");
+    CHECK(run_cli(i5) == 0, "cli: re-import with --force ok");
     unlink("/tmp/edoc_cli_c.txt");
     cleanup_path("/tmp/edoc_cli_c.edoc");
   }
@@ -1337,9 +1337,9 @@ static void test_cli_adversarial(void) {
     char *e[] = {"edoc", "export", "/tmp/adv_empty.edoc",
                  "/tmp/adv_empty_out.txt", NULL};
     char *v[] = {"edoc", "verify", "/tmp/adv_empty.edoc", NULL};
-    CHECK(run_cli(NULL, i) == 0, "adv: import empty body exits 0");
-    CHECK(run_cli(NULL, v) == 0, "adv: verify empty container exits 0");
-    CHECK(run_cli(NULL, e) == 0, "adv: export empty exits 0");
+    CHECK(run_cli(i) == 0, "adv: import empty body exits 0");
+    CHECK(run_cli(v) == 0, "adv: verify empty container exits 0");
+    CHECK(run_cli(e) == 0, "adv: export empty exits 0");
     CHECK(files_equal("/tmp/adv_empty.txt", "/tmp/adv_empty_out.txt"),
           "adv: empty roundtrip byte-equal");
     cleanup_path("/tmp/adv_empty.edoc");
@@ -1357,7 +1357,7 @@ static void test_cli_adversarial(void) {
                  "/tmp/adv_nul.edoc", NULL};
     char *e[] = {"edoc", "export", "/tmp/adv_nul.edoc",
                  "/tmp/adv_nul_out.txt", NULL};
-    CHECK(run_cli(NULL, i) == 0 && run_cli(NULL, e) == 0,
+    CHECK(run_cli(i) == 0 && run_cli(e) == 0,
           "adv: NUL-laden body import/export exit 0");
     CHECK(files_equal("/tmp/adv_nul.txt", "/tmp/adv_nul_out.txt"),
           "adv: NUL bytes survive roundtrip byte-exact");
@@ -1380,7 +1380,7 @@ static void test_cli_adversarial(void) {
                    "/tmp/adv_line.edoc", NULL};
       char *e[] = {"edoc", "export", "/tmp/adv_line.edoc",
                    "/tmp/adv_line_out.txt", NULL};
-      CHECK(run_cli(NULL, i) == 0 && run_cli(NULL, e) == 0,
+      CHECK(run_cli(i) == 0 && run_cli(e) == 0,
             "adv: single 512KB line import/export exit 0");
       CHECK(files_equal("/tmp/adv_line.txt", "/tmp/adv_line_out.txt"),
             "adv: newline-free roundtrip byte-equal");
@@ -1396,12 +1396,12 @@ static void test_cli_adversarial(void) {
     unlink("/tmp/adv_s.edoc");
     char *i[] = {"edoc", "import", "/tmp/adv_s.txt", "/tmp/adv_s.edoc",
                  NULL};
-    run_cli(NULL, i);
+    run_cli(i);
     write_text_file("/tmp/adv_stale_out.txt",
                     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 40);
     char *e[] = {"edoc", "export", "/tmp/adv_s.edoc",
                  "/tmp/adv_stale_out.txt", NULL};
-    CHECK(run_cli(NULL, e) == 0, "adv: export over stale output exits 0");
+    CHECK(run_cli(e) == 0, "adv: export over stale output exits 0");
     CHECK(files_equal("/tmp/adv_s.txt", "/tmp/adv_stale_out.txt"),
           "adv: stale output fully replaced (no residue)");
     unlink("/tmp/adv_s.txt");
@@ -1413,45 +1413,70 @@ static void test_cli_adversarial(void) {
   {
     write_text_file("/tmp/adv_plain.txt", "not a container", 15);
     char *e_missing[] = {"edoc", "export", NULL};
-    CHECK(run_cli(NULL, e_missing) == 1, "adv: export no args => 1");
+    CHECK(run_cli(e_missing) == 1, "adv: export no args => 1");
     char *e_extra[] = {"edoc", "export", "a", "b", "c", NULL};
-    CHECK(run_cli(NULL, e_extra) == 1, "adv: export extra positional => 1");
+    CHECK(run_cli(e_extra) == 1, "adv: export extra positional => 1");
     char *e_v0[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v", "0",
                     "/tmp/x.out", NULL};
-    CHECK(run_cli(NULL, e_v0) == 1, "adv: export -v 0 => usage 1");
+    CHECK(run_cli(e_v0) == 1, "adv: export -v 0 => usage 1");
     char *e_vjunk[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v",
                        "abc", "/tmp/x.out", NULL};
-    CHECK(run_cli(NULL, e_vjunk) == 1,
+    CHECK(run_cli(e_vjunk) == 1,
           "adv: export -v non-numeric => usage 1");
     char *e_both[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v", "1",
                       "--name", "v1", "/tmp/x.out", NULL};
-    CHECK(run_cli(NULL, e_both) == 1,
+    CHECK(run_cli(e_both) == 1,
           "adv: both selectors rejected (was silent name-wins)");
     char *e_vtail[] = {"edoc", "export", "/tmp/adv_plain.txt",
                        "/tmp/x.out", "-v", NULL};
-    CHECK(run_cli(NULL, e_vtail) == 1, "adv: dangling -v => usage 1");
+    CHECK(run_cli(e_vtail) == 1, "adv: dangling -v => usage 1");
 
     char *e_nf[] = {"edoc", "export", "/tmp/definitely_missing.edoc",
                     "/tmp/x.out", NULL};
-    CHECK(run_cli(NULL, e_nf) == 3, "adv: export missing file => 3");
+    CHECK(run_cli(e_nf) == 3, "adv: export missing file => 3");
     char *e_badmagic[] = {"edoc", "export", "/tmp/adv_plain.txt",
                           "/tmp/x.out", NULL};
-    CHECK(run_cli(NULL, e_badmagic) == 3,
+    CHECK(run_cli(e_badmagic) == 3,
           "adv: export plain-text-as-container => 3");
     char *h_bad[] = {"edoc", "history", "/tmp/adv_plain.txt", NULL};
-    CHECK(run_cli(NULL, h_bad) == 3, "adv: history on garbage => 3");
+    CHECK(run_cli(h_bad) == 3, "adv: history on garbage => 3");
     char *d_dir[] = {"edoc", "dump", "/tmp", NULL};
-    CHECK(run_cli(NULL, d_dir) == 3, "adv: dump a directory => 3, no crash");
+    CHECK(run_cli(d_dir) == 3, "adv: dump a directory => 3, no crash");
     char *v_dir[] = {"edoc", "verify", "/tmp", NULL};
-    CHECK(run_cli(NULL, v_dir) == 3, "adv: verify a directory => 3");
+    CHECK(run_cli(v_dir) == 3, "adv: verify a directory => 3");
     char *i_missing_txt[] = {"edoc", "import", "/tmp/no_such_src.txt",
                              "/tmp/adv_x.edoc", NULL};
-    CHECK(run_cli(NULL, i_missing_txt) == 3,
+    CHECK(run_cli(i_missing_txt) == 3,
           "adv: import missing source => 3");
+
+    /* CI-caught class: non-regular inputs must fail cleanly everywhere */
+    char *d_devnull[] = {"edoc", "dump", "/dev/null", NULL};
+    CHECK(run_cli(d_devnull) == 3, "adv: dump /dev/null => 3");
+    char *v_devnull[] = {"edoc", "verify", "/dev/null", NULL};
+    CHECK(run_cli(v_devnull) == 3, "adv: verify /dev/null => 3");
+    char *e_devnull[] = {"edoc", "export", "/dev/null", "/tmp/x.out",
+                         NULL};
+    CHECK(run_cli(e_devnull) == 3, "adv: export from /dev/null => 3");
+    write_text_file("/tmp/adv_src_ok.txt", "x", 1);
+    char *i_devnull[] = {"edoc", "import", "/dev/null",
+                         "/tmp/adv_dn.edoc", NULL};
+    CHECK(run_cli(i_devnull) == 3, "adv: import from /dev/null => 3");
+    unlink("/tmp/adv_src_ok.txt");
+
+    /* directory as import source and as export destination */
+    char *i_dir[] = {"edoc", "import", "/tmp", "/tmp/adv_dir.edoc",
+                     NULL};
+    CHECK(run_cli(i_dir) == 3, "adv: import from a directory => 3");
+    write_text_file("/tmp/adv_eout_src.txt", "y", 1);
+    char *e_outdir[] = {"edoc", "export", "/tmp/adv_eout_src.txt",
+                        "/tmp", NULL};
+    CHECK(run_cli(e_outdir) == 3,
+          "adv: export into a directory => 3");
+    unlink("/tmp/adv_eout_src.txt");
 
     /* recover is a report: quiet even for nonsense paths */
     char *r_none[] = {"edoc", "recover", "/tmp/nowhere/never.edoc", NULL};
-    CHECK(run_cli(NULL, r_none) == 0,
+    CHECK(run_cli(r_none) == 0,
           "adv: recover on absent path reports cleanly (exit 0)");
     unlink("/tmp/adv_plain.txt");
     unlink("/tmp/x.out");
@@ -1462,7 +1487,7 @@ static void test_cli_adversarial(void) {
     write_text_file("/tmp/adv_self.txt", "precious source", 15);
     char *self[] = {"edoc", "import", "/tmp/adv_self.txt",
                     "/tmp/adv_self.txt", "--force", NULL};
-    CHECK(run_cli(NULL, self) == 3,
+    CHECK(run_cli(self) == 3,
           "adv: import src==dst refused with --force too");
     ByteBuffer check;
     bool intact = read_whole_file_public("/tmp/adv_self.txt", &check) ==
@@ -1483,8 +1508,8 @@ static void test_cli_adversarial(void) {
                     "--force", "/tmp/adv_idem.edoc", NULL};
     char *exp[] = {"edoc", "export", "/tmp/adv_idem.edoc",
                    "/tmp/adv_idem_out.txt", NULL};
-    CHECK(run_cli(NULL, imp) == 0 && run_cli(NULL, impf) == 0 &&
-              run_cli(NULL, exp) == 0,
+    CHECK(run_cli(imp) == 0 && run_cli(impf) == 0 &&
+              run_cli(exp) == 0,
           "adv: repeated force-import chain exits 0");
     CHECK(files_equal("/tmp/adv_idem.txt", "/tmp/adv_idem_out.txt"),
           "adv: payload stable across force-reimport");
@@ -1527,14 +1552,14 @@ static void test_consistency_matrix(void) {
   CHECK(make_legacy_container(legacy), "mx: legacy container created");
   {
     char *h[] = {"edoc", "history", (char *)legacy, NULL};
-    CHECK(run_cli(NULL, h) == 0,
+    CHECK(run_cli(h) == 0,
           "mx: history on legacy file exits 0 (no versions)");
     char *d[] = {"edoc", "dump", (char *)legacy, NULL};
-    CHECK(run_cli(NULL, d) == 0,
+    CHECK(run_cli(d) == 0,
           "mx: dump on legacy file exits 0 (two sections)");
     char *e[] = {"edoc", "export", (char *)legacy,
                  "/tmp/mx_legacy_out.txt", NULL};
-    CHECK(run_cli(NULL, e) == 0, "mx: export document from legacy exits 0");
+    CHECK(run_cli(e) == 0, "mx: export document from legacy exits 0");
     ByteBuffer out;
     bool ok = read_whole_file_public("/tmp/mx_legacy_out.txt", &out) ==
                   STORAGE_OK &&
@@ -1543,7 +1568,7 @@ static void test_consistency_matrix(void) {
     CHECK(ok, "mx: legacy document bytes exported intact");
     char *vsel[] = {"edoc", "export", (char *)legacy, "-v",
                     "1",     "/tmp/mx_v1.txt", NULL};
-    CHECK(run_cli(NULL, vsel) == 3,
+    CHECK(run_cli(vsel) == 3,
           "mx: version select on history-less file => 3");
     unlink("/tmp/mx_legacy_out.txt");
     unlink("/tmp/mx_v1.txt");
@@ -1578,7 +1603,7 @@ static void test_consistency_matrix(void) {
       snprintf(sel, sizeof(sel), "%d", id);
       snprintf(outp, sizeof(outp), "/tmp/mx_v%d.out", id);
       char *ex[] = {"edoc", "export", (char *)p, "-v", sel, outp, NULL};
-      CHECK(run_cli(NULL, ex) == 0, "mx: export -v <id> exits 0");
+      CHECK(run_cli(ex) == 0, "mx: export -v <id> exits 0");
       char exp[64];
       snprintf(exp, sizeof(exp), "payload of revision %d", id);
       ByteBuffer out;
@@ -1591,7 +1616,7 @@ static void test_consistency_matrix(void) {
     }
     char *en[] = {"edoc",       "export",      (char *)p, "--name",
                   "α-version-β", "/tmp/mx_uni.out", NULL};
-    CHECK(run_cli(NULL, en) == 0, "mx: export by unicode name exits 0");
+    CHECK(run_cli(en) == 0, "mx: export by unicode name exits 0");
     ByteBuffer uo;
     bool ueq = read_whole_file_public("/tmp/mx_uni.out", &uo) ==
                    STORAGE_OK &&
@@ -1620,9 +1645,9 @@ static void test_consistency_matrix(void) {
     bytebuffer_free(&img);
 
     char *v_bad[] = {"edoc", "verify", "/tmp/mx_plain.txt", NULL};
-    CHECK(run_cli(NULL, v_bad) == 3, "mx: verify non-container => 3");
+    CHECK(run_cli(v_bad) == 3, "mx: verify non-container => 3");
     char *v_fut[] = {"edoc", "verify", "/tmp/mx_future.edoc", NULL};
-    CHECK(run_cli(NULL, v_fut) == 3,
+    CHECK(run_cli(v_fut) == 3,
           "mx: verify future format version => 3");
     unlink("/tmp/mx_plain.txt");
     unlink("/tmp/mx_future.edoc");
@@ -1640,10 +1665,10 @@ static void test_consistency_matrix(void) {
       fclose(f);
       cleanup_path("/tmp/mx_long.edoc");
       char *i[] = {"edoc", "import", src, "/tmp/mx_long.edoc", NULL};
-      CHECK(run_cli(NULL, i) == 0,
+      CHECK(run_cli(i) == 0,
             "mx: import with ~600-char filename succeeds");
       char *vv[] = {"edoc", "verify", "/tmp/mx_long.edoc", NULL};
-      CHECK(run_cli(NULL, vv) == 0,
+      CHECK(run_cli(vv) == 0,
             "mx: container from long-name import verifies");
       unlink(src);
       cleanup_path("/tmp/mx_long.edoc");

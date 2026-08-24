@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -228,7 +231,9 @@ static int cmd_export(int argc, char **argv) {
     return 3;
   }
   size_t total = doc.len;
-  size_t w = fwrite(doc.data, 1, total, f);
+  size_t w = 0;
+  if (total) /* fwrite(NULL,0,f) is UB even though glibc tolerates it */
+    w = fwrite(doc.data, 1, total, f);
   fclose(f);
   bytebuffer_free(&doc);
   if (w != total) {
@@ -272,27 +277,45 @@ static int cmd_import(int argc, char **argv) {
     return 3;
   }
 
-  /* Read the plain-text source fully. */
-  FILE *f = fopen(txt, "rb");
-  if (!f) {
+  /* Read the plain-text source fully. Regular files only — same
+     directory/device hazard the library reader guards against. */
+  int src_fd = open(txt, O_RDONLY);
+  if (src_fd < 0) {
     perror(txt);
     return 3;
   }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  rewind(f);
+  struct stat src_sb;
   ByteBuffer body;
   bytebuffer_init(&body);
-  if (sz > 0 &&
-      (!bytebuffer_reserve(&body, (size_t)sz) ||
-       fread(body.data, 1, (size_t)sz, f) != (size_t)sz)) {
-    fprintf(stderr, "%s: read failed\n", txt);
-    fclose(f);
-    bytebuffer_free(&body);
+  if (fstat(src_fd, &src_sb) != 0 || !S_ISREG(src_sb.st_mode)) {
+    fprintf(stderr, "%s: not a regular file\n", txt);
+    close(src_fd);
     return 3;
   }
-  body.len = (size_t)(sz > 0 ? sz : 0);
-  fclose(f);
+  if (src_sb.st_size > 0) {
+    if (!bytebuffer_reserve(&body, (size_t)src_sb.st_size)) {
+      fprintf(stderr, "%s: out of memory\n", txt);
+      close(src_fd);
+      return 3;
+    }
+    size_t got = 0;
+    while (got < (size_t)src_sb.st_size) {
+      ssize_t r = read(src_fd, body.data + got, (size_t)src_sb.st_size - got);
+      if (r < 0) {
+        if (errno == EINTR)
+          continue;
+        perror(txt);
+        close(src_fd);
+        bytebuffer_free(&body);
+        return 3;
+      }
+      if (r == 0)
+        break; /* file shrank concurrently: accept what we got */
+      got += (size_t)r;
+    }
+    body.len = got;
+  }
+  close(src_fd);
 
   /* Session open is fine here: import IS a write operation. */
   StorageSession *s = NULL;

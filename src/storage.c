@@ -243,26 +243,33 @@ static StorageStatus read_whole_file(const char *path, ByteBuffer *out) {
   if (!f)
     return STORAGE_ERR_NOT_FOUND;
 
-  if (fseek(f, 0, SEEK_END) != 0) {
+  /* Regular files only: on glibc, fopen() succeeds for directories and
+     fstat-based sizing is authoritative where fseek/ftell heuristics
+     return garbage (CI caught a 2^63-byte allocation attempt). */
+  struct stat st;
+  if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
     fclose(f);
     return STORAGE_ERR_IO;
   }
-  long size = ftell(f);
-  if (size < 0) {
+  if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
     fclose(f);
     return STORAGE_ERR_IO;
   }
-  rewind(f);
 
   bytebuffer_init(out);
-  if (size > 0 && !bytebuffer_reserve(out, (size_t)size)) {
+  size_t size = (size_t)st.st_size;
+  if (size == 0) { /* empty regular file is valid input */
+    fclose(f);
+    return STORAGE_OK;
+  }
+  if (!bytebuffer_reserve(out, size)) {
     fclose(f);
     return STORAGE_ERR_NOMEM;
   }
 
   size_t total_read = 0;
-  while (total_read < (size_t)size) {
-    size_t r = fread(out->data + total_read, 1, (size_t)size - total_read, f);
+  while (total_read < size) {
+    size_t r = fread(out->data + total_read, 1, size - total_read, f);
     if (r == 0) {
       if (feof(f))
         break;
