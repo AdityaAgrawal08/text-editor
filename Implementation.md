@@ -150,6 +150,11 @@ c73648d → 39cabb9 → 9bd7017 (+ docs sync). Highlights:
   long-filename imports, post-discard recovery quieting, introspection
   early-out summary contracts.
 - Static analysis clean: gcc -fanalyzer 0 findings, clang --analyze 0 findings.
+- CI caught a portability class local runs masked: glibc fopen() succeeds
+  on directories and ftell(SEEK_END) returns ~2^63 there -> 2^63-byte
+  allocation attempt (ASan abort). All file readers now fstat-gate to
+  regular files with authoritative sizing; empty-export fwrite(NULL,0)
+  UB also fixed. Locked by /dev/null + directory regression checks.
 - Full suite green under gcc+clang with -Werror + _FORTIFY_SOURCE=2.
 
 ---
