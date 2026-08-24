@@ -861,9 +861,17 @@ static StorageStatus read_whole_file_public(const char *path,
   long sz = ftell(f);
   rewind(f);
   bytebuffer_init(out);
-  if (sz <= 0 || !bytebuffer_reserve(out, (size_t)sz)) {
+  if (sz < 0) {
     fclose(f);
     return STORAGE_ERR_IO;
+  }
+  if (sz == 0) { /* empty files are valid input, not an error */
+    fclose(f);
+    return STORAGE_OK;
+  }
+  if (!bytebuffer_reserve(out, (size_t)sz)) {
+    fclose(f);
+    return STORAGE_ERR_NOMEM;
   }
   size_t got = fread(out->data, 1, (size_t)sz, f);
   fclose(f);
@@ -1312,6 +1320,181 @@ static void test_cli_roundtrips(void) {
   }
 }
 
+/* ===================================================================== *
+ * W2 hardening: adversarial CLI battery — the cases large products get
+ * burned by. Boundary bodies (empty / NUL-laden / no-newline), a full
+ * exit-code matrix, hostile argument shapes, and self-destructive
+ * invocations.
+ * ===================================================================== */
+
+static void test_cli_adversarial(void) {
+  /* --- boundary bodies -------------------------------------------- */
+  { /* zero-byte document: legal UTF-8 body of length 0 */
+    write_text_file("/tmp/adv_empty.txt", "", 0);
+    unlink("/tmp/adv_empty.edoc");
+    unlink("/tmp/adv_empty_out.txt");
+    char *i[] = {"edoc", "import", "/tmp/adv_empty.txt",
+                 "/tmp/adv_empty.edoc", NULL};
+    char *e[] = {"edoc", "export", "/tmp/adv_empty.edoc",
+                 "/tmp/adv_empty_out.txt", NULL};
+    char *v[] = {"edoc", "verify", "/tmp/adv_empty.edoc", NULL};
+    CHECK(run_cli(NULL, i) == 0, "adv: import empty body exits 0");
+    CHECK(run_cli(NULL, v) == 0, "adv: verify empty container exits 0");
+    CHECK(run_cli(NULL, e) == 0, "adv: export empty exits 0");
+    CHECK(files_equal("/tmp/adv_empty.txt", "/tmp/adv_empty_out.txt"),
+          "adv: empty roundtrip byte-equal");
+    cleanup_path("/tmp/adv_empty.edoc");
+    unlink("/tmp/adv_empty.txt");
+    unlink("/tmp/adv_empty_out.txt");
+  }
+
+  { /* NUL bytes and control characters inside the body */
+    static const char nul_body[] = {'a', '\0', '\0', 'b', '\n', '\0',
+                                    '\t', 0x01, 0x7f, 'z'};
+    write_text_file("/tmp/adv_nul.txt", nul_body, sizeof(nul_body));
+    unlink("/tmp/adv_nul.edoc");
+    unlink("/tmp/adv_nul_out.txt");
+    char *i[] = {"edoc", "import", "/tmp/adv_nul.txt",
+                 "/tmp/adv_nul.edoc", NULL};
+    char *e[] = {"edoc", "export", "/tmp/adv_nul.edoc",
+                 "/tmp/adv_nul_out.txt", NULL};
+    CHECK(run_cli(NULL, i) == 0 && run_cli(NULL, e) == 0,
+          "adv: NUL-laden body import/export exit 0");
+    CHECK(files_equal("/tmp/adv_nul.txt", "/tmp/adv_nul_out.txt"),
+          "adv: NUL bytes survive roundtrip byte-exact");
+    cleanup_path("/tmp/adv_nul.edoc");
+    unlink("/tmp/adv_nul.txt");
+    unlink("/tmp/adv_nul_out.txt");
+  }
+
+  { /* one enormous line, no newline anywhere */
+    enum { LINE = 512 * 1024 };
+    char *blob = malloc(LINE);
+    CHECK(blob != NULL, "adv: alloc huge-line body");
+    if (blob) {
+      memset(blob, 'Q', LINE);
+      write_text_file("/tmp/adv_line.txt", blob, LINE);
+      free(blob);
+      unlink("/tmp/adv_line.edoc");
+      unlink("/tmp/adv_line_out.txt");
+      char *i[] = {"edoc", "import", "/tmp/adv_line.txt",
+                   "/tmp/adv_line.edoc", NULL};
+      char *e[] = {"edoc", "export", "/tmp/adv_line.edoc",
+                   "/tmp/adv_line_out.txt", NULL};
+      CHECK(run_cli(NULL, i) == 0 && run_cli(NULL, e) == 0,
+            "adv: single 512KB line import/export exit 0");
+      CHECK(files_equal("/tmp/adv_line.txt", "/tmp/adv_line_out.txt"),
+            "adv: newline-free roundtrip byte-equal");
+      cleanup_path("/tmp/adv_line.edoc");
+      unlink("/tmp/adv_line.txt");
+      unlink("/tmp/adv_line_out.txt");
+    }
+  }
+
+  /* --- export overwrites stale longer output ----------------------- */
+  {
+    write_text_file("/tmp/adv_s.txt", "tiny", 4);
+    unlink("/tmp/adv_s.edoc");
+    char *i[] = {"edoc", "import", "/tmp/adv_s.txt", "/tmp/adv_s.edoc",
+                 NULL};
+    run_cli(NULL, i);
+    write_text_file("/tmp/adv_stale_out.txt",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 40);
+    char *e[] = {"edoc", "export", "/tmp/adv_s.edoc",
+                 "/tmp/adv_stale_out.txt", NULL};
+    CHECK(run_cli(NULL, e) == 0, "adv: export over stale output exits 0");
+    CHECK(files_equal("/tmp/adv_s.txt", "/tmp/adv_stale_out.txt"),
+          "adv: stale output fully replaced (no residue)");
+    unlink("/tmp/adv_s.txt");
+    unlink("/tmp/adv_stale_out.txt");
+    cleanup_path("/tmp/adv_s.edoc");
+  }
+
+  /* --- exit-code matrix & hostile args ----------------------------- */
+  {
+    write_text_file("/tmp/adv_plain.txt", "not a container", 15);
+    char *e_missing[] = {"edoc", "export", NULL};
+    CHECK(run_cli(NULL, e_missing) == 1, "adv: export no args => 1");
+    char *e_extra[] = {"edoc", "export", "a", "b", "c", NULL};
+    CHECK(run_cli(NULL, e_extra) == 1, "adv: export extra positional => 1");
+    char *e_v0[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v", "0",
+                    "/tmp/x.out", NULL};
+    CHECK(run_cli(NULL, e_v0) == 1, "adv: export -v 0 => usage 1");
+    char *e_vjunk[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v",
+                       "abc", "/tmp/x.out", NULL};
+    CHECK(run_cli(NULL, e_vjunk) == 1,
+          "adv: export -v non-numeric => usage 1");
+    char *e_both[] = {"edoc", "export", "/tmp/adv_plain.txt", "-v", "1",
+                      "--name", "v1", "/tmp/x.out", NULL};
+    CHECK(run_cli(NULL, e_both) == 1,
+          "adv: both selectors rejected (was silent name-wins)");
+    char *e_vtail[] = {"edoc", "export", "/tmp/adv_plain.txt",
+                       "/tmp/x.out", "-v", NULL};
+    CHECK(run_cli(NULL, e_vtail) == 1, "adv: dangling -v => usage 1");
+
+    char *e_nf[] = {"edoc", "export", "/tmp/definitely_missing.edoc",
+                    "/tmp/x.out", NULL};
+    CHECK(run_cli(NULL, e_nf) == 3, "adv: export missing file => 3");
+    char *e_badmagic[] = {"edoc", "export", "/tmp/adv_plain.txt",
+                          "/tmp/x.out", NULL};
+    CHECK(run_cli(NULL, e_badmagic) == 3,
+          "adv: export plain-text-as-container => 3");
+    char *h_bad[] = {"edoc", "history", "/tmp/adv_plain.txt", NULL};
+    CHECK(run_cli(NULL, h_bad) == 3, "adv: history on garbage => 3");
+    char *d_dir[] = {"edoc", "dump", "/tmp", NULL};
+    CHECK(run_cli(NULL, d_dir) == 3, "adv: dump a directory => 3, no crash");
+    char *v_dir[] = {"edoc", "verify", "/tmp", NULL};
+    CHECK(run_cli(NULL, v_dir) == 3, "adv: verify a directory => 3");
+    char *i_missing_txt[] = {"edoc", "import", "/tmp/no_such_src.txt",
+                             "/tmp/adv_x.edoc", NULL};
+    CHECK(run_cli(NULL, i_missing_txt) == 3,
+          "adv: import missing source => 3");
+
+    /* recover is a report: quiet even for nonsense paths */
+    char *r_none[] = {"edoc", "recover", "/tmp/nowhere/never.edoc", NULL};
+    CHECK(run_cli(NULL, r_none) == 0,
+          "adv: recover on absent path reports cleanly (exit 0)");
+    unlink("/tmp/adv_plain.txt");
+    unlink("/tmp/x.out");
+  }
+
+  /* --- import must never destroy its own source -------------------- */
+  {
+    write_text_file("/tmp/adv_self.txt", "precious source", 15);
+    char *self[] = {"edoc", "import", "/tmp/adv_self.txt",
+                    "/tmp/adv_self.txt", "--force", NULL};
+    CHECK(run_cli(NULL, self) == 3,
+          "adv: import src==dst refused with --force too");
+    ByteBuffer check;
+    bool intact = read_whole_file_public("/tmp/adv_self.txt", &check) ==
+                      STORAGE_OK &&
+                  check.len == 15;
+    bytebuffer_free(&check);
+    CHECK(intact, "adv: source file survived the refused self-import");
+    unlink("/tmp/adv_self.txt");
+  }
+
+  /* --- idempotent force-import keeps payload stable ------------------ */
+  {
+    write_text_file("/tmp/adv_idem.txt", "stable payload\n", 15);
+    unlink("/tmp/adv_idem.edoc");
+    char *imp[] = {"edoc", "import", "/tmp/adv_idem.txt",
+                   "/tmp/adv_idem.edoc", NULL};
+    char *impf[] = {"edoc",       "import", "/tmp/adv_idem.txt",
+                    "--force", "/tmp/adv_idem.edoc", NULL};
+    char *exp[] = {"edoc", "export", "/tmp/adv_idem.edoc",
+                   "/tmp/adv_idem_out.txt", NULL};
+    CHECK(run_cli(NULL, imp) == 0 && run_cli(NULL, impf) == 0 &&
+              run_cli(NULL, exp) == 0,
+          "adv: repeated force-import chain exits 0");
+    CHECK(files_equal("/tmp/adv_idem.txt", "/tmp/adv_idem_out.txt"),
+          "adv: payload stable across force-reimport");
+    unlink("/tmp/adv_idem.txt");
+    unlink("/tmp/adv_idem_out.txt");
+    cleanup_path("/tmp/adv_idem.edoc");
+  }
+}
+
 int main(void) {
   test_new_document();
   test_save_and_reload();
@@ -1333,6 +1516,7 @@ int main(void) {
   test_toolkit_read_versions();
   test_toolkit_recovery_report();
   test_cli_roundtrips();
+  test_cli_adversarial();
 
   printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

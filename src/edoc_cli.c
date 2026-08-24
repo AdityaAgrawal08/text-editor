@@ -33,7 +33,7 @@ static int usage(void) {
           "  history FILE                 list embedded versions\n"
           "  export FILE [-v ID|--name X] OUT\n"
           "                               write document/version as plain UTF-8\n"
-          "  import TXT FILE [--force]    wrap plain text into a new container\n"
+          "  import TXT FILE [--force]    wrap text into container (--force keeps history)\n"
           "  recover FILE                 report pending journal/autosave state\n"
           "\n"
           "exit codes: 0 ok, 1 usage, 2 verification failed, 3 I/O/format\n",
@@ -183,6 +183,10 @@ static int cmd_export(int argc, char **argv) {
   }
   if (!file || !out)
     return usage();
+  if (want_id >= 0 && want_name) {
+    fprintf(stderr, "%s: use either -v ID or --name X, not both\n", g_prog);
+    return usage();
+  }
 
   ByteBuffer doc;
   bytebuffer_init(&doc);
@@ -252,16 +256,20 @@ static int cmd_import(int argc, char **argv) {
   }
   if (!txt || !file)
     return usage();
+  if (strcmp(txt, file) == 0) {
+    fprintf(stderr, "%s: source and destination are the same file\n",
+            g_prog);
+    return 3; /* refuse before the --force unlink destroys the source */
+  }
 
-  FILE *probe = fopen(file, "rb");
-  if (probe) {
-    fclose(probe);
-    if (!force) {
-      fprintf(stderr,
-              "%s: already exists (use --force to overwrite)\n", file);
-      return 3;
-    }
-    unlink(file);
+  /* Clobber guard WITHOUT unlinking: removing the target first would
+     open a window where concurrent readers see no file at all. The
+     atomic tmp+rename inside storage_save is the only writer step, so
+     readers always observe either the old image or the new one. */
+  if (!force && access(file, F_OK) == 0) {
+    fprintf(stderr, "%s: already exists (use --force to overwrite)\n",
+            file);
+    return 3;
   }
 
   /* Read the plain-text source fully. */

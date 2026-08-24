@@ -465,7 +465,7 @@ static StorageStatus parse_edoc_image(const uint8_t *data, size_t len,
     *out_history = NULL;
     *out_history_len = 0;
   }
-  if (len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE)
+  if (len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE || !data)
     return STORAGE_ERR_TRUNCATED;
 
   uint32_t magic = read_u32_le(data);
@@ -1469,7 +1469,7 @@ StorageStatus storage_inspect_file(const char *path,
     return st;
   out_summary->file_size = raw.len;
 
-  if (raw.len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE) {
+  if (raw.len < FILE_HEADER_SIZE + FILE_FOOTER_SIZE || !raw.data) {
     bytebuffer_free(&raw);
     return STORAGE_ERR_TRUNCATED;
   }
